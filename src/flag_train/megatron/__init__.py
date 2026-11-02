@@ -10,6 +10,7 @@ from .fused_pad_routing_map import fused_pad_routing_map
 from .fused_proj_rms_backward import fused_proj_rms_backward
 from .fused_proj_rms_forward import fused_proj_rms_forward
 from .quick_gelu import quick_gelu
+from .weighted_squared_relu_impl import weighted_squared_relu_impl
 
 __all__ = [
     "fast_gelu",
@@ -19,6 +20,7 @@ __all__ = [
     "fused_proj_rms_backward",
     "fused_proj_rms_forward",
     "quick_gelu",
+    "weighted_squared_relu_impl",
 ]
 
 SpecOpRegistrar(registry=globals(), vendor=runtime_device.vendor_name).apply()
