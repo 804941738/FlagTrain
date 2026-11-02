@@ -1,15 +1,22 @@
 # Copyright 2026 FlagOS Contributors
-# SPDX-License-Identifier: Apache-2.0
-"""Bias + tanh GELU with first-order autograd, matching Megatron's interface.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Bias + tanh GELU with first-order Autograd and standard LibEntry launches.
 
-Operands must share a supported dtype/device and obey PyTorch broadcasting.
-Scalar, vector and arbitrary broadcast biases are supported; uncommon layouts
-are materialized. Triton or Autograd reduces the elementwise gradients to operand shapes.
-The add is rounded to the operand dtype before fp32 activation arithmetic.
-Higher-order gradients are deliberately unsupported.
+The addition and elementwise gradients round to the operand dtype; activation
+arithmetic and bias accumulation use FP32. Vector-bias training saves the
+activation derivative. General broadcasts retain an elementwise fallback.
 """
-
-from contextlib import nullcontext
 
 import torch
 import triton
@@ -19,10 +26,9 @@ from flag_train.runtime import device as runtime_device
 from flag_train.runtime import torch_device_fn
 from flag_train.utils import libentry, tl_extra_shim
 from flag_train.utils import triton_lang_extension as tle
-from flag_train.utils.libentry import major_version as _entry_major
-from flag_train.utils.libentry import minor_version as _entry_minor
 
 _DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+_NUM_WARPS = 4
 
 
 @triton.jit
@@ -35,15 +41,6 @@ def _load_z(X, B, offsets, mask, H: tl.constexpr, MODE: tl.constexpr):
     else:
         b = tl.load(B + offsets, mask, other=0).to(tl.float32)
     return (x + b).to(X.dtype.element_ty).to(tl.float32)
-
-
-@libentry()
-@triton.jit
-def _forward(X, B, Y, N, H: tl.constexpr, MODE: tl.constexpr, BLOCK: tl.constexpr):
-    offsets = tle.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    z = _load_z(X, B, offsets, offsets < N, H, MODE)
-    t = tl_extra_shim.tanh(0.79788456 * z * (1.0 + 0.044715 * z * z))
-    tl.store(Y + offsets, 0.5 * z * (1.0 + t), offsets < N)
 
 
 @triton.jit
@@ -64,6 +61,36 @@ def _gelu_derivative(z, t, u, DTYPE: tl.constexpr):
     return tl.where((tl.abs(z) == float("inf")) | (z != z), float("nan"), d)
 
 
+@triton.jit
+def _compensated_add(acc, correction, value):
+    # Keep small FP32 bias sums accurate without changing Inf/NaN propagation.
+    value = value - correction
+    updated = acc + value
+    correction = tl.where(tl.abs(updated) < float("inf"), (updated - acc) - value, 0.0)
+    return updated, correction
+
+
+@libentry()
+@triton.jit
+def _forward(X, B, Y, N, H: tl.constexpr, MODE: tl.constexpr, BLOCK: tl.constexpr):
+    offsets = tle.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    z = _load_z(X, B, offsets, offsets < N, H, MODE)
+    t = tl_extra_shim.tanh(0.79788456 * z * (1.0 + 0.044715 * z * z))
+    tl.store(Y + offsets, 0.5 * z * (1.0 + t), offsets < N)
+
+
+@libentry()
+@triton.jit
+def _forward_saved(X, B, Y, D, N, H: tl.constexpr, BLOCK: tl.constexpr):
+    offsets = tle.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    z = _load_z(X, B, offsets, offsets < N, H, 1)
+    u = 0.79788456 * z * (1.0 + 0.044715 * z * z)
+    t = tl_extra_shim.tanh(u)
+    tl.store(Y + offsets, 0.5 * z * (1.0 + t), offsets < N)
+    d = _gelu_derivative(z, t, u, X.dtype.element_ty)
+    tl.store(D + offsets, d, offsets < N)
+
+
 @libentry()
 @triton.jit
 def _backward(X, B, G, DX, N, H: tl.constexpr, MODE: tl.constexpr, BLOCK: tl.constexpr):
@@ -82,163 +109,6 @@ def _backward(X, B, G, DX, N, H: tl.constexpr, MODE: tl.constexpr, BLOCK: tl.con
 
 @libentry()
 @triton.jit
-def _reduce_bias(
-    P, DB, H: tl.constexpr, PARTS: tl.constexpr, BR: tl.constexpr, BC: tl.constexpr
-):
-    rows = tl.arange(0, BR)
-    cols = tle.program_id(0) * BC + tl.arange(0, BC)
-    acc = tl.full((BR, BC), 0, tl.float32)
-    correction = tl.full((BR, BC), 0, tl.float32)
-    for tile in range(triton.cdiv(PARTS, BR)):
-        rr = (tile * BR + rows).to(tl.int64)
-        v = tl.load(
-            P + rr[:, None] * H + cols[None, :],
-            (rr[:, None] < PARTS) & (cols[None, :] < H),
-            0,
-        )
-        if DB.dtype.element_ty == tl.float32:
-            value = v - correction
-            updated = acc + value
-            correction = tl.where(
-                tl.abs(updated) < float("inf"), (updated - acc) - value, 0.0
-            )
-            acc = updated
-        else:
-            acc += v
-    tl.store(DB + cols, tl.sum(acc, 0), cols < H)
-
-
-def _backward_block(n, dtype):
-    # H20 V1 cutoffs confirmed against the original source by the lead engineer.
-    if dtype == torch.float32 or n < (1 << 20):
-        return 256
-    return 1024 if n < (1 << 23) else 2048
-
-
-# Fixed configurations need no LibEntry tuning on NVIDIA. Use Triton's own
-# device/stream-aware JIT cache; retain framework dispatch for other backends.
-_forward_launch = _forward.fn if runtime_device.vendor_name == "nvidia" else _forward
-_backward_launch = _backward.fn if runtime_device.vendor_name == "nvidia" else _backward
-
-
-_backward_cache = {}
-
-
-def _launch_backward(x, b, upstream, grad, n, h, mode, block):
-    args = (x, b, upstream, grad, n, h, mode, block)
-    grid = (triton.cdiv(n, block), 1, 1)
-    if runtime_device.vendor_name != "nvidia":
-        _launch_fixed_entry(_backward_launch, grid, args)
-        return
-    # Cache compiled Triton code, never tensors or streams. CompiledKernel uses
-    # the caller's current stream. Preserve pointer-alignment specialization.
-    key = (
-        x.device.index,
-        x.dtype,
-        n,
-        h,
-        mode,
-        block,
-        tuple(t.data_ptr() % 16 == 0 for t in args[:4]),
-    )
-    kernel = _backward_cache.get(key)
-    if kernel is None:
-        kernel = _backward_launch[grid](*args, num_warps=4)
-        if len(_backward_cache) >= 256:
-            _backward_cache.clear()
-        _backward_cache[key] = kernel
-    else:
-        kernel[grid](*args)
-
-
-_vector_cache = {}
-
-
-_generic_arg_indices = {}
-
-
-def _launch_fixed_entry(entry, grid, args):
-    # Use LibEntry's own backend-aware specialization key and cache. Never
-    # bypass tuners, heuristics, hooks, or older compiled-argument protocols.
-    if not isinstance(entry.fn, triton.runtime.JITFunction) or not (
-        _entry_major == 3 and 3 <= _entry_minor <= 6
-    ):
-        entry[grid](*args, num_warps=4)
-        return
-    indices = _generic_arg_indices.get(entry)
-    if indices is None:
-        indices = (
-            tuple(entry.specialize_indices),
-            tuple(entry.do_not_specialize_indices),
-            tuple(p.num for p in entry.jit_function.params if p.is_constexpr),
-        )
-        _generic_arg_indices[entry] = indices
-    spec, dns, const = indices
-    key = entry.key(
-        tuple(args[i] for i in spec),
-        tuple(args[i] for i in dns),
-        tuple(args[i] for i in const),
-    )
-    device = torch_device_fn.current_device()
-    cache = entry._cpu_cache if device == "cpu" else entry.kernel_cache[device]
-    cached = cache.get(key)
-    if cached is None or cached[4]:
-        entry[grid](*args, num_warps=4)
-    else:
-        # Rebind every launch so the installed backend resolves its stream in
-        # the same way as LibEntry.run; cache invalidation remains authoritative.
-        cached[0][grid](*args)
-
-
-def _launch_kernel(jit, grid, tensors, constants):
-    if runtime_device.vendor_name != "nvidia" or not isinstance(
-        jit.fn, triton.runtime.JITFunction
-    ):
-        _launch_fixed_entry(jit, grid, (*tensors, *constants))
-        return
-    jit = jit.fn
-    key = (
-        jit,
-        tensors[0].device.index,
-        tuple((t.dtype, t.data_ptr() % 16 == 0) for t in tensors),
-        constants,
-    )
-    kernel = _vector_cache.get(key)
-    args = (*tensors, *constants)
-    if kernel is None:
-        kernel = jit[grid](*args, num_warps=4)
-        if len(_vector_cache) >= 256:
-            _vector_cache.clear()
-        _vector_cache[key] = kernel
-    else:
-        kernel[grid](*args)
-
-
-def _backward_device_guard(x):
-    # Avoid entering an already-active CUDA device context. A different device
-    # and every non-NVIDIA backend still use the framework's device guard.
-    if (
-        runtime_device.vendor_name == "nvidia"
-        and torch_device_fn.current_device() == x.device.index
-    ):
-        return nullcontext()
-    return torch_device_fn.device(x.device)
-
-
-@libentry()
-@triton.jit
-def _forward_saved(X, B, Y, D, N, H: tl.constexpr, BLOCK: tl.constexpr):
-    offsets = tle.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    z = _load_z(X, B, offsets, offsets < N, H, 1)
-    u = 0.79788456 * z * (1.0 + 0.044715 * z * z)
-    t = tl_extra_shim.tanh(u)
-    tl.store(Y + offsets, 0.5 * z * (1.0 + t), offsets < N)
-    d = _gelu_derivative(z, t, u, X.dtype.element_ty)
-    tl.store(D + offsets, d, offsets < N)
-
-
-@libentry()
-@triton.jit
 def _saved_backward(
     D,
     G,
@@ -248,7 +118,6 @@ def _saved_backward(
     H: tl.constexpr,
     BR: tl.constexpr,
     BC: tl.constexpr,
-    BIAS: tl.constexpr,
 ):
     pid = tle.program_id(0)
     column_tiles = triton.cdiv(H, BC)
@@ -261,9 +130,35 @@ def _saved_backward(
     g = tl.load(G + offsets, mask, 0).to(tl.float32)
     dx = (d * g).to(DX.dtype.element_ty)
     tl.store(DX + offsets, dx, mask)
-    if BIAS:
-        partial = tl.sum(tl.where(mask, dx.to(tl.float32), 0.0), 0)
-        tl.store(P + row_tile * H + cols, partial, cols < H)
+    partial = tl.sum(tl.where(mask, dx.to(tl.float32), 0.0), 0)
+    tl.store(P + row_tile * H + cols, partial, cols < H)
+
+
+@libentry()
+@triton.jit
+def _saved_backward_columns(
+    D,
+    G,
+    DX,
+    DB,
+    R: tl.constexpr,
+    H: tl.constexpr,
+    BR: tl.constexpr,
+    BC: tl.constexpr,
+):
+    rows = tl.arange(0, BR)
+    cols = tle.program_id(0) * BC + tl.arange(0, BC)
+    acc = tl.full((BR, BC), 0, tl.float32)
+    for tile in range(triton.cdiv(R, BR)):
+        rr = tile * BR + rows
+        offsets = rr[:, None] * H + cols[None, :]
+        mask = (rr[:, None] < R) & (cols[None, :] < H)
+        d = tl.load(D + offsets, mask, 0)
+        g = tl.load(G + offsets, mask, 0).to(tl.float32)
+        dx = (d * g).to(DX.dtype.element_ty)
+        tl.store(DX + offsets, dx, mask)
+        acc += tl.where(mask, dx.to(tl.float32), 0.0)
+    tl.store(DB + cols, tl.sum(acc, 0), cols < H)
 
 
 @libentry()
@@ -296,12 +191,7 @@ def _saved_backward_loop(
         if BIAS:
             value = tl.where(mask, dx.to(tl.float32), 0.0)
             if DX.dtype.element_ty == tl.float32:
-                value -= correction
-                updated = acc + value
-                correction = tl.where(
-                    tl.abs(updated) < float("inf"), (updated - acc) - value, 0.0
-                )
-                acc = updated
+                acc, correction = _compensated_add(acc, correction, value)
             else:
                 acc += value
     if BIAS:
@@ -310,33 +200,37 @@ def _saved_backward_loop(
 
 @libentry()
 @triton.jit
-def _saved_backward_columns(
-    D,
-    G,
-    DX,
-    DB,
-    R: tl.constexpr,
-    H: tl.constexpr,
-    BR: tl.constexpr,
-    BC: tl.constexpr,
-    BIAS: tl.constexpr,
+def _reduce_bias(
+    P, DB, H: tl.constexpr, PARTS: tl.constexpr, BR: tl.constexpr, BC: tl.constexpr
 ):
     rows = tl.arange(0, BR)
     cols = tle.program_id(0) * BC + tl.arange(0, BC)
     acc = tl.full((BR, BC), 0, tl.float32)
-    for tile in range(triton.cdiv(R, BR)):
-        rr = tile * BR + rows
-        offsets = rr[:, None] * H + cols[None, :]
-        mask = (rr[:, None] < R) & (cols[None, :] < H)
-        d = tl.load(D + offsets, mask, 0)
-        g = tl.load(G + offsets, mask, 0).to(tl.float32)
-        dx = (d * g).to(DX.dtype.element_ty)
-        tl.store(DX + offsets, dx, mask)
-        acc += tl.where(mask, dx.to(tl.float32), 0.0)
+    correction = tl.full((BR, BC), 0, tl.float32)
+    for tile in range(triton.cdiv(PARTS, BR)):
+        rr = (tile * BR + rows).to(tl.int64)
+        v = tl.load(
+            P + rr[:, None] * H + cols[None, :],
+            (rr[:, None] < PARTS) & (cols[None, :] < H),
+            0,
+        )
+        if DB.dtype.element_ty == tl.float32:
+            acc, correction = _compensated_add(acc, correction, v)
+        else:
+            acc += v
     tl.store(DB + cols, tl.sum(acc, 0), cols < H)
 
 
+def _backward_block(n, dtype):
+    # Larger low-precision tiles amortize elementwise memory traffic.
+    if dtype == torch.float32 or n < (1 << 20):
+        return 256
+    return 1024 if n < (1 << 23) else 2048
+
+
 class _BiasGeluSaved(torch.autograd.Function):
+    """Vector-bias training: cache FP32 derivatives, fuse gradient production."""
+
     @staticmethod
     def forward(ctx, input, bias):
         x, b = input.contiguous(), bias.contiguous()
@@ -345,14 +239,11 @@ class _BiasGeluSaved(torch.autograd.Function):
         derivative = torch.empty(x.shape, dtype=torch.float32, device=x.device)
         block = 512 if n >= (1 << 20) else 256
         with torch_device_fn.device(x.device):
-            _launch_kernel(
-                _forward_saved,
-                (triton.cdiv(n, block), 1, 1),
-                (x, b, out, derivative),
-                (n, h, block),
+            _forward_saved[(triton.cdiv(n, block),)](
+                x, b, out, derivative, n, h, BLOCK=block, num_warps=_NUM_WARPS
             )
+        # Retain operands as well as the derivative for Autograd version checks.
         ctx.save_for_backward(x, b, derivative)
-        ctx.n, ctx.h = n, h
         return out
 
     @staticmethod
@@ -360,131 +251,157 @@ class _BiasGeluSaved(torch.autograd.Function):
         if torch.is_grad_enabled():
             raise RuntimeError("bias_gelu_impl supports first-order gradients only")
         x, b, derivative = ctx.saved_tensors
+        n, h = x.numel(), b.numel()
+        rows = n // h
         grad = torch.empty_like(x)
-        h, rows = ctx.h, ctx.n // ctx.h
         upstream = grad_output.contiguous()
         need_bias = ctx.needs_input_grad[1]
-        if rows == 1:
-            with _backward_device_guard(x):
-                _launch_kernel(
-                    _saved_backward_loop,
-                    (triton.cdiv(h, 1024), 1, 1),
-                    (derivative, upstream, grad, grad),
-                    (1, h, 1, 1024, False),
+        db = None
+        with torch_device_fn.device(x.device):
+            if rows == 1 or not need_bias:
+                _saved_backward_loop[(rows * triton.cdiv(h, 1024),)](
+                    derivative,
+                    upstream,
+                    grad,
+                    grad,
+                    rows,
+                    h,
+                    BR=1,
+                    BC=1024,
+                    BIAS=False,
+                    num_warps=_NUM_WARPS,
                 )
-            return grad if ctx.needs_input_grad[0] else None, (
-                grad.view(b.shape) if need_bias else None
-            )
-        if need_bias and ctx.n <= (1 << 20) and rows > 128:
-            db = torch.empty_like(b)
-            with _backward_device_guard(x):
-                _launch_kernel(
-                    _saved_backward_columns,
-                    (triton.cdiv(h, 8), 1, 1),
-                    (derivative, upstream, grad, db),
-                    (rows, h, 256, 8, True),
+                if need_bias:
+                    db = grad.view(b.shape)
+            elif n <= (1 << 16) and rows <= 128:
+                db = torch.empty_like(b)
+                _saved_backward[(triton.cdiv(h, 64),)](
+                    derivative,
+                    upstream,
+                    grad,
+                    db,
+                    rows,
+                    h,
+                    BR=triton.next_power_of_2(rows),
+                    BC=64,
+                    num_warps=_NUM_WARPS,
                 )
-            return grad if ctx.needs_input_grad[0] else None, db
-        small = ctx.n <= (1 << 16) and rows <= 128
-        br = triton.next_power_of_2(rows) if small else (32 if rows >= 1024 else 8)
-        bc = 64 if small else (256 if x.dtype == torch.float32 else 512)
-        parts = triton.cdiv(rows, br)
-        if need_bias:
-            db = torch.empty_like(b)
-            partial = (
-                db
-                if small
-                else torch.empty((parts, h), dtype=torch.float32, device=x.device)
-            )
-        else:
-            db, partial = None, grad
-            br, bc, parts = 1, 1024, rows
-        with _backward_device_guard(x):
-            _launch_kernel(
-                _saved_backward if small else _saved_backward_loop,
-                (parts * triton.cdiv(h, bc), 1, 1),
-                (derivative, upstream, grad, partial),
-                (rows, h, br, bc, need_bias),
-            )
-            if need_bias and not small:
-                _launch_kernel(
-                    _reduce_bias,
-                    (triton.cdiv(h, 32), 1, 1),
-                    (partial, db),
-                    (h, parts, 32, 32),
+            elif n <= (1 << 20) or rows <= 256:
+                # Few rows fit one column-owned reduction, avoiding partials.
+                bc = 8 if n <= (1 << 20) else 32
+                db = torch.empty_like(b)
+                _saved_backward_columns[(triton.cdiv(h, bc),)](
+                    derivative,
+                    upstream,
+                    grad,
+                    db,
+                    rows,
+                    h,
+                    BR=256,
+                    BC=bc,
+                    num_warps=_NUM_WARPS,
+                )
+            else:
+                br = 32 if rows >= 1024 else 8
+                bc = 256 if x.dtype == torch.float32 else 512
+                parts = triton.cdiv(rows, br)
+                db = torch.empty_like(b)
+                partial = torch.empty((parts, h), dtype=torch.float32, device=x.device)
+                _saved_backward_loop[(parts * triton.cdiv(h, bc),)](
+                    derivative,
+                    upstream,
+                    grad,
+                    partial,
+                    rows,
+                    h,
+                    BR=br,
+                    BC=bc,
+                    BIAS=True,
+                    num_warps=_NUM_WARPS,
+                )
+                _reduce_bias[(triton.cdiv(h, 32),)](
+                    partial,
+                    db,
+                    h,
+                    parts,
+                    BR=32,
+                    BC=32,
+                    num_warps=_NUM_WARPS,
                 )
         return grad if ctx.needs_input_grad[0] else None, db
 
 
 class _BiasGelu(torch.autograd.Function):
+    """General broadcasting: save operands, let Autograd reduce gradient shapes."""
+
     @staticmethod
     def forward(ctx, input, bias):
         if input.ndim and bias.ndim == 1 and bias.numel() == input.shape[-1]:
             x, b = input.contiguous(), bias.contiguous()
-            shape, h, mode = input.shape, bias.numel(), 1
+            h, mode = bias.numel(), 1
         else:
-            return _BiasGelu._broadcast_forward(ctx, input, bias)
-        return _BiasGelu._launch_forward(ctx, input, x, b, shape, h, mode)
-
-    @staticmethod
-    def _broadcast_forward(ctx, input, bias):
-        x, b = torch.broadcast_tensors(input, bias)
-        shape = x.shape
-        x = x.contiguous()
-        h = shape[-1] if shape else 1
-        if bias.numel() == 1:
-            b, mode = bias.contiguous(), 0
-        elif (
-            x.numel()
-            and h
-            and b.stride(-1) == 1
-            and all(s == 0 for s in b.stride()[:-1])
-        ):
-            b, mode = b.reshape(-1, h)[0].contiguous(), 1
-        elif bias.ndim == 1 and bias.numel() == h:
-            b, mode = bias.contiguous(), 1
-        else:
-            b, mode = b.contiguous(), 2
-        return _BiasGelu._launch_forward(ctx, input, x, b, shape, h, mode)
-
-    @staticmethod
-    def _launch_forward(ctx, input, x, b, shape, h, mode):
+            x, expanded = torch.broadcast_tensors(input, bias)
+            x = x.contiguous()
+            h = x.shape[-1] if x.ndim else 1
+            if bias.numel() == 1:
+                b, mode = bias.contiguous(), 0
+            elif (
+                x.numel()
+                and h
+                and expanded.stride(-1) == 1
+                and all(s == 0 for s in expanded.stride()[:-1])
+            ):
+                b, mode = expanded.reshape(-1, h)[0].contiguous(), 1
+            elif bias.ndim == 1 and bias.numel() == h:
+                b, mode = bias.contiguous(), 1
+            else:
+                b, mode = expanded.contiguous(), 2
         ctx.save_for_backward(x, b)
         ctx.h, ctx.mode = h, mode
-        out = torch.empty(shape, dtype=input.dtype, device=input.device)
-        n = out.numel()
+        out = torch.empty_like(x)
+        n = x.numel()
         if n:
-            with torch_device_fn.device(input.device):
-                _forward_launch[(triton.cdiv(n, 256),)](
-                    x, b, out, n, h, mode, BLOCK=256, num_warps=4
+            with torch_device_fn.device(x.device):
+                _forward[(triton.cdiv(n, 256),)](
+                    x, b, out, n, h, mode, BLOCK=256, num_warps=_NUM_WARPS
                 )
         return out
 
     @staticmethod
     def backward(ctx, grad_output):
-        # The engine disables grad mode for ordinary backward. Reject higher
-        # orders explicitly without wrapping each first-order call in no_grad.
         if torch.is_grad_enabled():
             raise RuntimeError("bias_gelu_impl supports first-order gradients only")
         x, b = ctx.saved_tensors
         grad = torch.empty_like(x)
-        n = grad.numel()
+        n = x.numel()
         if n:
             block = _backward_block(n, x.dtype)
-            with _backward_device_guard(x):
-                _launch_backward(
-                    x, b, grad_output.contiguous(), grad, n, ctx.h, ctx.mode, block
+            with torch_device_fn.device(x.device):
+                _backward[(triton.cdiv(n, block),)](
+                    x,
+                    b,
+                    grad_output.contiguous(),
+                    grad,
+                    n,
+                    ctx.h,
+                    ctx.mode,
+                    BLOCK=block,
+                    num_warps=_NUM_WARPS,
                 )
-
-        # Like Megatron's GeLUFunction: the engine sum_to's each gradient to
-        # its original input shape, including scalar and empty broadcasts.
-        return grad if ctx.needs_input_grad[0] else None, (
-            grad if ctx.needs_input_grad[1] else None
+        # The engine sums both returned gradients to the original operand shapes.
+        return (
+            grad if ctx.needs_input_grad[0] else None,
+            grad if ctx.needs_input_grad[1] else None,
         )
 
 
 def bias_gelu_impl(input, bias):
-    """Return GELU(input + bias), using the tanh approximation (first order)."""
+    """Return tanh GELU(input + bias), with first-order gradients for both operands.
+
+    FP16/BF16/FP32 tensors must share the active accelerator and obey PyTorch
+    broadcasting. Noncontiguous inputs are materialized; empty tensors are valid.
+    Invalid types raise TypeError; invalid dtype, device or shapes raise ValueError.
+    """
     for name, tensor in (("input", input), ("bias", bias)):
         if not isinstance(tensor, torch.Tensor):
             raise TypeError(f"{name} must be a tensor")
@@ -494,7 +411,8 @@ def bias_gelu_impl(input, bias):
             raise ValueError(f"{name} must be on the active accelerator")
     if input.dtype != bias.dtype or input.device != bias.device:
         raise ValueError("input and bias must have the same dtype and device")
-    if not (input.ndim and bias.ndim == 1 and bias.numel() == input.shape[-1]):
+    vector_bias = input.ndim and bias.ndim == 1 and bias.numel() == input.shape[-1]
+    if not vector_bias:
         try:
             torch.broadcast_shapes(input.shape, bias.shape)
         except RuntimeError:
@@ -504,9 +422,7 @@ def bias_gelu_impl(input, bias):
     if (
         torch.is_grad_enabled()
         and (input.requires_grad or bias.requires_grad)
-        and input.ndim
-        and bias.ndim == 1
-        and bias.numel() == input.shape[-1]
+        and vector_bias
         and input.numel()
     ):
         return _BiasGeluSaved.apply(input, bias)

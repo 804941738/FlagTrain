@@ -1,11 +1,20 @@
 # Copyright 2026 FlagOS Contributors
-# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Triton numerical and autograd regressions beyond the shared operator contract suite."""
 
 import pytest
 import torch
-import triton
-import triton.language as tl
 
 import flag_train
 from flag_train.runtime import device
@@ -58,7 +67,7 @@ def test_higher_order_rejected():
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-def test_cached_launch_alignment(dtype):
+def test_unaligned_views_and_upstream(dtype):
     # Contiguous views can have unaligned pointers. Reusing a graph with a
     # different upstream pointer must not reuse incompatible specialization.
     x = torch.randn(4097, device=flag_train.device, dtype=dtype)[1:].view(64, 64)
@@ -80,38 +89,31 @@ def test_cached_launch_alignment(dtype):
             torch.testing.assert_close(a, e, rtol=tolerance, atol=tolerance)
 
 
-def test_fixed_entry_invalidation_and_hooks(monkeypatch):
+def test_standard_libentry_dispatch(monkeypatch):
     import importlib
 
-    from flag_train.runtime import torch_device_fn
+    from flag_train.utils.libentry import LibEntry
 
     module = importlib.import_module("flag_train.megatron.bias_gelu_impl")
-    entry = module._saved_backward
-    derivative = torch.rand(4, 7, device=flag_train.device)
-    upstream = torch.rand_like(derivative)
-    grad = torch.empty_like(derivative)
-    db = torch.empty(7, device=derivative.device)
-    args = (derivative, upstream, grad, db, 4, 7, 4, 8, True)
-    events = []
-    with torch_device_fn.device(derivative.device):
-        device_index = torch_device_fn.current_device()
-        cache = entry.kernel_cache[device_index]
-        cache.clear()
-        module._launch_fixed_entry(entry, (1, 1, 1), args)
-        key = next(iter(cache))
-        saved = cache[key]
+    run = LibEntry.run
+    launched = []
 
-        def hook(parameters):
-            events.append(parameters["H"])
+    def record(entry, *args, **kwargs):
+        launched.append(entry)
+        return run(entry, *args, **kwargs)
 
-        monkeypatch.setitem(cache, key, (*saved[:4], ((hook, {}),)))
-        module._launch_fixed_entry(entry, (1, 1, 1), args)
-        assert events == [7]
-        cache.clear()
-        module._launch_fixed_entry(entry, (1, 1, 1), args)
-        assert len(cache) == 1
-    torch.testing.assert_close(grad, derivative * upstream)
-    torch.testing.assert_close(db, (derivative * upstream).sum(0))
+    monkeypatch.setattr(LibEntry, "run", record)
+    x = torch.randn(4, 7, device=flag_train.device, requires_grad=True)
+    b = torch.randn(7, device=x.device, requires_grad=True)
+    y = flag_train.megatron.bias_gelu_impl(x, b)
+    g = torch.randn_like(y)
+    actual = torch.autograd.grad(y, (x, b), g)
+    expected = torch.autograd.grad(
+        torch.nn.functional.gelu(x + b, approximate="tanh"), (x, b), g
+    )
+    assert launched == [module._forward_saved, module._saved_backward]
+    for a, e in zip(actual, expected):
+        torch.testing.assert_close(a, e, rtol=2e-5, atol=2e-5)
 
 
 def test_single_row_large_hidden_grid():
@@ -128,33 +130,14 @@ def test_single_row_large_hidden_grid():
     assert torch.all(db == 0.5)
 
 
-@triton.jit
-def _dispatch_copy(X, Y, N: tl.constexpr, BLOCK: tl.constexpr):
-    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    tl.store(Y + offsets, tl.load(X + offsets, offsets < N, 0), offsets < N)
-
-
-def test_wrapped_entry_uses_framework_dispatch():
-    import importlib
-
-    from flag_train.runtime import torch_device_fn
-    from flag_train.utils import libentry
-
-    module = importlib.import_module("flag_train.megatron.bias_gelu_impl")
-    observed = []
-
-    def block_size(arguments):
-        observed.append(arguments["N"])
-        return 128
-
-    entry = libentry()(triton.heuristics({"BLOCK": block_size})(_dispatch_copy))
-    for size in (127, 65):
-        source = torch.randn(size, device=flag_train.device)
-        target = torch.empty_like(source)
-        with torch_device_fn.device(source.device):
-            module._launch_kernel(entry, (1, 1, 1), (source, target), (size,))
-        torch.testing.assert_close(target, source)
-    assert 127 in observed and 65 in observed
+def test_input_version_check():
+    x = torch.randn(4, 7, device=flag_train.device, requires_grad=True)
+    b = torch.randn(7, device=x.device, requires_grad=True)
+    y = flag_train.megatron.bias_gelu_impl(x, b)
+    with torch.no_grad():
+        x.add_(1)
+    with pytest.raises(RuntimeError, match="modified by an inplace operation"):
+        torch.autograd.grad(y, (x, b), torch.ones_like(y))
 
 
 @pytest.mark.parametrize("case", ["positive_inf", "opposite_inf", "nan"])
@@ -211,3 +194,13 @@ def test_large_row_fp32_high_precision_reduction():
             torch.testing.assert_close(
                 db[columns], expected_db.to(x.device), rtol=2e-5, atol=2e-5
             )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_wide_bias_column_reduction(dtype):
+    from .test_bias_gelu_impl import _check
+
+    torch.manual_seed(0)
+    x = torch.randn(256, 32768, device=flag_train.device, dtype=dtype)
+    b = torch.randn(32768, device=x.device, dtype=dtype)
+    _check(x, b)

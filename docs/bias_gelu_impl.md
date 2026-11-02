@@ -1,130 +1,129 @@
-# Portable bias_gelu_impl
+# Bias GELU
 
-`flag_train.megatron.bias_gelu_impl(input, bias)` computes tanh GELU of the
-broadcast sum. Both operands must share an accelerator, device index and dtype
-(FP16, BF16 or FP32). Scalar and arbitrary broadcast bias, noncontiguous tensors,
-empty inputs and first-order gradients for both operands are supported.
+`flag_train.megatron.bias_gelu_impl(input, bias)` returns the tanh approximation
+of GELU applied to the broadcast sum:
 
-The addition rounds to the operand dtype before FP32 activation arithmetic.
-Elementwise gradients round to the operand dtype **before** bias reduction.
-Reductions accumulate in FP32 and cast only at final writeback. FP32 segmented
-sums use compensated accumulation; nonfinite accumulators reset the compensation
-to preserve infinity/NaN propagation. The derivative
-bounds its polynomial at ±10 to preserve saturated gradients for extreme finite
-values; nonfinite sums have NaN derivatives. Higher orders are explicitly rejected.
-Existing correctness tolerances are unchanged.
+```text
+z = input + bias
+y = 0.5 * z * (1 + tanh(0.79788456 * z * (1 + 0.044715 * z * z)))
+```
 
-## Shared computation
+Both operands must be tensors on the same active accelerator, with the same
+FP16, BF16 or FP32 dtype. The output has the broadcast shape and operand dtype.
+Scalar, vector and general PyTorch broadcasting are supported, including empty
+and noncontiguous tensors. Noncontiguous operands are materialized as needed.
+Invalid operand types raise `TypeError`; invalid dtype, device or broadcast
+shapes raise `ValueError`.
 
-All six backends import this same source; no vendor-specific implementation of
-this operator is present in the repository. FlagTrain's existing vendor registrar
-can still install an external override, so each deployment should verify the
-public function's `__module__` before attributing results to this implementation.
-There are no custom C/C++ or CUDA sources, extension loaders, PyBind modules,
-private compiler builds, inline assembly or CUDA-only imports in the operator.
+## Triton implementation
 
-For nonempty vector bias requiring gradients, `_BiasGeluSaved` executes:
+Every device kernel uses `@libentry()` above `@triton.jit` and is launched through
+its standard `kernel[grid](...)` interface inside `torch_device_fn.device(...)`.
+Compilation, specialization, stream selection and caching belong to FlagTrain
+and its installed Triton/FlagTree backend. The operator has no vendor-specific
+launch branch, private cache or dependency on LibEntry's internal cache layout.
 
-1. `_forward_saved`: fused output plus FP32 derivative checkpoint, reusing tanh.
-2. `_saved_backward`, `_saved_backward_columns` or `_saved_backward_loop`: multiply
-   the checkpoint by grad_output, round dInput, and accumulate bias gradients.
-3. `_reduce_bias` when partial reduction is needed.
+All six target platforms reuse these kernels from the same source:
 
-These kernels and the `_gelu_derivative` mathematical helper are shared across
-NVIDIA, Ascend, MetaX, Iluvatar, Hygon and T-Head. Math uses `tl_extra_shim.tanh`,
-selected by the installed backend through `triton_lang_helper.py`; there is no
-separate NVIDIA tanh formula. FP32 derivatives use an equivalent logistic/sech
-expression to avoid cancellation, retaining exact FP32 tanh saturation; other
-dtypes reuse the forward tanh expression. This dtype policy is shared by all
-backends and introduces no FP64 production arithmetic. Indexing uses `tle.program_id` and wide offsets.
-Backward grids are flattened to one dimension to avoid a large column count
-exceeding a secondary grid-dimension limit. Programs own disjoint output ranges;
-partial reduction runs afterwards on the same current stream, with no atomics
-or inter-program spin barriers.
+- `_forward`: inference and general broadcast forward.
+- `_forward_saved`: vector-bias training forward, writing output and a FP32
+  derivative checkpoint in one pass.
+- `_backward`: elementwise gradient for the broadcast fallback.
+- `_saved_backward`: small vector-bias gradient and local bias reduction.
+- `_saved_backward_columns`: column-owned reduction with no partial workspace.
+- `_saved_backward_loop`: elementwise or segmented vector-bias gradient.
+- `_reduce_bias`: final reduction of FP32 partial bias gradients.
 
-General broadcasts retain `_BiasGelu`: the generic forward/elementwise backward
-kernels plus Autograd sum-to-shape. They reuse the same derivative helper. Empty
-inputs and inference do not allocate the derivative checkpoint. Scalar biases
-and general broadcast shapes retain this fallback. Noncontiguous vector inputs
-are materialized before entering the shared checkpoint path.
+Indexing uses `tle.program_id` and wide offsets. Grids use only their first
+dimension, avoiding secondary grid-dimension limits. Mathematical helpers use
+standard Triton operations and `tl_extra_shim.tanh`, which the platform layer
+selects through `triton_lang_helper.py`. No custom C/C++ or CUDA extension is used.
 
-The checkpoint costs **4*N bytes** during training. Larger backward workspaces
-cost `4*ceil(rows/BR)*hidden` bytes. At 16384x4096, the checkpoint is 256 MiB and
-the 32-row partial workspace is 8 MiB (previously 32 MiB with eight-row segments).
-Single-row bias gradients reuse a view of dInput and need no bias workspace.
-This memory/time tradeoff must be considered for large training activations.
+## Autograd and reduction
 
-## Shape policy and launch policy
+Two Python Autograd classes keep different saved-state lifetimes explicit.
+`_BiasGeluSaved` handles nonempty vector bias when either operand needs gradients.
+It caches the derivative and retains the operands for Autograd version checks.
+`_BiasGelu` handles other broadcasts, empty inputs and inference; it saves operands
+and reconstructs the derivative when needed. General broadcast gradients are
+returned in the expanded output shape and reduced by the Autograd engine to each
+original operand shape. No derivative checkpoint is allocated for inference.
 
-The host shape policy is separate from kernel mathematics. Current defaults were
-measured on H20; they are starting points, not proven optimal foreign-device
-settings. All launches use the abstract Triton `num_warps=4` interface, with no
-hardcoded NVIDIA SM count, lane shuffle or warp-specific device instructions.
+Backward supports input-only, bias-only and joint gradients. Single-row bias
+gradients reuse a view of dInput. Small inputs use a local reduction; medium
+inputs and inputs with at most 256 rows use a column-owned reduction; other
+larger inputs write partial sums and launch
+a second reduction kernel. These strategies have different memory access and
+parallelism requirements, so retaining them avoids forcing every shape through
+one inefficient reduction. Programs write disjoint output ranges; the final
+reduction runs afterwards on the same current stream, with no atomics or
+cross-program synchronization.
 
-| Case | Shared backward | BR | BC | Launches |
-|---|---|---:|---:|---:|
-| One row / input-gradient-only | Elementwise loop | 1 | 1024 | 1 |
-| N<=65536, rows<=128 | Full local row reduction | next power of two(rows) | 64 | 1 |
-| N<=1048576, rows>128 | Streaming column reduction | 256 | 8 | 1 |
-| Other vector bias | Partial row reduction | 32 if rows>=1024, otherwise 8 | 256 for FP32, 512 otherwise | 2 |
+Higher-order gradients raise `RuntimeError`. Nondefault streams and saved-tensor
+in-place modification checks are covered by regression tests.
 
-Training forward uses BLOCK=512 for N>=1048576 and 256 otherwise. General
-broadcast forward retains BLOCK=256. Further per-backend tuning can change the
-host policy while retaining these same mathematical kernels.
+## Numerical contract
 
-NVIDIA uses a bounded cache of plain compiled Triton kernels, keyed by device,
-dtypes, constants and alignment. It never caches tensors or stream handles.
-Wrapped kernels retain framework dispatch. Generic launches use LibEntry's own
-backend-aware key and authoritative per-device kernel cache; this preserves
-backend specialization such as Hygon pointer/buffer rules and cache invalidation.
-For plain JIT kernels with the repository's full-argument protocol (Triton
-3.3–3.6), a local shortcut avoids rebuilding general argument dictionaries.
-Cache misses, pre-hooks, tuners/heuristics and other argument protocols use full
-LibEntry dispatch. The shared `libentry.py` is unchanged. The backend rebinds its
-kernel launcher per call and resolves the current stream; foreign backends are
-never sent through the NVIDIA alignment-only cache or CUDA device shortcuts.
+Bias addition rounds to the operand dtype before FP32 activation arithmetic.
+Elementwise gradients round to the operand dtype **before** bias reduction;
+partial sums accumulate in FP32 and cast only at the final bias writeback.
 
-## Reproduction on H20
+The shared FP32 derivative uses a stable logistic/sech expression to avoid
+cancellation, retaining the FP32 tanh saturation behavior. Other dtypes reuse the
+forward tanh. The derivative bounds its polynomial at ±10 so extreme finite
+values retain saturated gradients without `0 * inf`. Nonfinite pre-activations
+have NaN derivatives.
+
+FP32 segmented reductions use compensated accumulation. Nonfinite accumulators
+reset the compensation to preserve infinity/NaN propagation. The large-row
+accuracy regression keeps per-element FP32 rounding and unchanged `2e-5`
+tolerances, with FP64 reference accumulation on CPU when the backend lacks FP64.
+Production arithmetic does not require FP64.
+
+## Training memory
+
+The derivative checkpoint costs **4 * N bytes**, where N is the output element
+count. A segmented reduction additionally needs
+`4 * ceil(rows / BR) * hidden` bytes of partial sums, as well as the gradient
+outputs. For a 16384x4096 FP32 activation, the derivative is **256 MiB** and the
+32-row partial workspace is **8 MiB**. Checkpointing trades this memory for
+avoiding repeated activation evaluation during backward. Inference has no
+checkpoint, and single-row reduction has no partial workspace.
+
+## Validation on H20
 
 ```bash
 export CUDA_VISIBLE_DEVICES=1
 python -m pytest tests/megatron/test_bias_gelu_impl.py \
   tests/megatron/test_bias_gelu_triton_regression.py -q -rs --tb=short
-python tools/check_bias_gelu_generic.py
-python tools/bench_bias_gelu_h20.py --implementation default --rounds 3 \
-  --output /workspace/flagtrain_results/codex_perf/backward_margin/final_native
-python tools/bench_bias_gelu_h20.py --implementation generic --rounds 3 \
-  --output /workspace/flagtrain_results/codex_perf/backward_margin/final_generic
+python tools/bench_bias_gelu_h20.py --rounds 3 \
+  --output /workspace/flagtrain_results/codex_perf/unified_validation
+python -m pytest benchmark/megatron/test_bias_gelu_impl.py \
+  -m bias_gelu_impl --level core --mode kernel --record json \
+  --output /workspace/flagtrain_results/codex_perf/unified_megatron.json -vs
 ```
 
-`--implementation generic` is an explicit **diagnostic-process-only** selection
-from `tools/bias_gelu_paths.py`. It temporarily selects the real generic launch
-branches through module bindings, then restores them; it is not a thread-safe
-production dispatch API. Production code never imports this helper or detects
-benchmark names/environment. The public interface and shared mathematical kernels
-remain in the measured path. H20 generic results still use the H20 compiler and
-device and do not establish Ascend/MetaX/Iluvatar/Hygon/T-Head performance.
+The independent H20 tool measures the complete public interface against
+`F.gelu(input + bias, approximate="tanh")`, using the same operands and upstream
+gradients. It covers seven core shapes, three dtypes and separate forward and
+backward timings, with full `autograd.grad` for both operands. Backward graphs
+are prepared outside timing. Ordinary `triton.testing.do_bench` uses 25 ms
+warmup, 100 ms repetition and median latency. All rounds, absolute latencies,
+per-item speedups and arithmetic/geometric aggregates are saved to CSV/JSON.
+Single-shape, dtype and direction filters support diagnosis. The direction
+geometric-mean acceptance floor is 0.80; individual slower cases are reported.
+Megatron Eager remains a separate reference and is never substituted for PyTorch.
 
-Both paths use identical seeded inputs and grad_output, the same PyTorch
-`F.gelu(x+b, approximate="tanh")` baseline and full `autograd.grad` including both
-gradients. Ordinary `do_bench` uses warmup=25ms, rep=100ms and median latency;
-backward graph construction is outside timing. CSV/JSON retain all rounds and
-absolute delays. Forward/backward are measured separately. The generic path uses
-the same checkpoint and reduction policy, including workspace allocation.
+## Backend validation
 
-The repository's earlier acceptance floor remains direction geometric mean
->=0.80; the portable-backward engineering target is generic backward >=0.80 on
-H20 and NVIDIA backward >=1.00 where possible. Per-case slowdowns are reported.
-All measurements and failed experiments are stored outside the source tree in
-`/workspace/flagtrain_results/codex_perf/backward_margin/`.
+NVIDIA H20, Ascend 910B, MetaX, Iluvatar, Hygon and T-Head use the same computation
+and public LibEntry launch mechanism, subject to FlagTrain's existing external
+vendor registration. Deployments should verify the exported function's module
+when attributing results to this source.
 
-Foreign-device compiler support for layouts, FP32 accumulation, tanh accuracy,
-grid limits, register/shared-memory resources and launch protocols still requires
-real hardware tests. No foreign platform has been performance-certified here.
-
-The extended large-row accuracy regression keeps 2e-5 tolerances and per-element
-FP32 rounding, but uses FP64 **reference** accumulation (CPU when the backend has
-no FP64). The original 102 correctness tests and performance baseline are not
-modified. A plain FP32 reference sum at 16384 rows was observed to differ from
-FP64 accumulation by up to 6.1e-5; that reference error is recorded separately
-from operator error. Infinity/NaN upstream gradients have explicit regressions.
+Current tiling defaults were measured on H20. Other devices still require real
+compilation, correctness and performance tests, especially for tanh/exp accuracy,
+FP32 reduction, grid limits, register/shared-memory use and compiler layout
+support. If necessary, tune the host shape policy without copying mathematical
+kernels. H20 results do not establish performance or compatibility on other
+hardware. CPU-only whole-package import is also not certified by H20 tests.

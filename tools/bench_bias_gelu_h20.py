@@ -1,5 +1,16 @@
 # Copyright 2026 FlagOS Contributors
-# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Public-interface eager comparison; same timing boundary as benchmark/base.py."""
 
 import argparse
@@ -11,13 +22,11 @@ import json
 import math
 import statistics
 import subprocess
-from contextlib import nullcontext
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 import triton
-from bias_gelu_paths import generic_execution
 
 import flag_train
 
@@ -49,14 +58,10 @@ def main():
     p.add_argument("--direction", choices=["forward", "backward"])
     p.add_argument("--rounds", type=int, default=1)
     p.add_argument("--output", required=True)
-    p.add_argument(
-        "--implementation", choices=["default", "generic"], default="default"
-    )
     a = p.parse_args()
     if a.rounds < 1:
         p.error("--rounds must be positive")
-    with generic_execution() if a.implementation == "generic" else nullcontext():
-        run(a)
+    run(a)
 
 
 def run(a):
@@ -154,9 +159,9 @@ def run(a):
         summary=summaries,
         failures=failures,
         slow_cases=slow_cases,
-        below_hard_gate=[r for r in rows if r["speedup"] < 0.8],
+        slow_measurements=[r for r in rows if r["speedup"] < 0.8],
         environment=dict(
-            implementation=a.implementation,
+            implementation="unified_libentry",
             public_module=flag_train.megatron.bias_gelu_impl.__module__,
             commit=subprocess.check_output(
                 ["git", "rev-parse", "HEAD"], text=True
@@ -188,9 +193,11 @@ def run(a):
     print(json.dumps(summaries, indent=2), flush=True)
     print(
         f"DIRECTION GEOMEAN FAILURES <0.80: {len(failures)}; "
-        f'individual measurements <0.80: {len(result["below_hard_gate"])}',
+        f'individual measurements <0.80: {len(result["slow_measurements"])}',
         flush=True,
     )
+    if failures:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
