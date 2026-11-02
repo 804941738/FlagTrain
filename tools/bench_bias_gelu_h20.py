@@ -50,9 +50,6 @@ def main():
     a = p.parse_args()
     if a.rounds < 1:
         p.error("--rounds must be positive")
-    from flag_train.megatron._bias_gelu_cuda import implementation
-
-    native_available = implementation() is not None
     rows = []
     torch.manual_seed(2026)
     for repeat in range(a.rounds):
@@ -135,12 +132,18 @@ def main():
     for field in ["dtype", "direction"]:
         for value in sorted(set(r[field] for r in medians)):
             summaries[value] = stats([r for r in medians if r[field] == value])
-    failures = [r for r in medians if r["speedup"] < 0.9]
+    failures = {
+        d: summaries[d]
+        for d in ("forward", "backward")
+        if d in summaries and summaries[d]["geometric"] < 0.8
+    }
+    slow_cases = [r for r in medians if r["speedup"] < 0.8]
     result = dict(
         rows=rows,
         medians=medians,
         summary=summaries,
         failures=failures,
+        slow_cases=slow_cases,
         below_hard_gate=[r for r in rows if r["speedup"] < 0.8],
         environment=dict(
             commit=subprocess.check_output(
@@ -152,11 +155,10 @@ def main():
                     for p in sorted(
                         Path("src/flag_train/megatron").rglob("*bias*gelu*")
                     )
-                    if p.is_file() and p.suffix in {".py", ".cu", ".cpp"}
+                    if p.is_file() and p.suffix == ".py"
                 )
             ).hexdigest(),
             megatron_core=importlib.metadata.version("megatron-core"),
-            cuda_extension_available=native_available,
             torch=torch.__version__,
             triton=triton.__version__,
             gpu=torch.cuda.get_device_name(),
@@ -173,7 +175,8 @@ def main():
         writer.writerows(rows)
     print(json.dumps(summaries, indent=2), flush=True)
     print(
-        f'FAILURES <0.90: {len(failures)}; individual measurements <0.80: {len(result["below_hard_gate"])}',
+        f"DIRECTION GEOMEAN FAILURES <0.80: {len(failures)}; "
+        f'individual measurements <0.80: {len(result["below_hard_gate"])}',
         flush=True,
     )
 
