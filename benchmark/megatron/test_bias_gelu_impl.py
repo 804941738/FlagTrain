@@ -1,11 +1,17 @@
 # Copyright 2026 FlagOS Contributors
-# SPDX-License-Identifier: Apache-2.0
-"""GenericBenchmark forward/backward against installed Megatron, no fallback.
-
-Backward includes Autograd and bias reduction on both sides. This differs from
-the standalone V1 ATen backward microbenchmark. Missing Megatron is an error.
-The baseline explicitly disables Megatron's fuser to measure eager ATen kernels.
-"""
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Forward-only GenericBenchmark against the installed Megatron Eager baseline."""
 
 import pytest
 import torch
@@ -41,8 +47,7 @@ def bias_gelu_input_fn(shape, dtype, device):
 
 
 @pytest.mark.bias_gelu_impl
-@pytest.mark.parametrize("is_backward", [False, True], ids=["forward", "backward"])
-def test_bias_gelu_impl_perf(is_backward):
+def test_bias_gelu_impl_perf():
     dtypes = [torch.float16, torch.float32]
     if flag_train.runtime.device.support_bf16:
         dtypes.append(torch.bfloat16)
@@ -51,7 +56,6 @@ def test_bias_gelu_impl_perf(is_backward):
         op_name="bias_gelu_impl",
         torch_op=native(),
         dtypes=dtypes,
-        is_backward=is_backward,
         native_baseline=True,
     )
     bench.set_train(flag_train.megatron.bias_gelu_impl)

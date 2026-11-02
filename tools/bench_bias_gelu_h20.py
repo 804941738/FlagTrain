@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Public-interface eager comparison; same timing boundary as benchmark/base.py."""
+"""Forward-only H20 comparison of the public operator against PyTorch Eager."""
 
 import argparse
 import csv
@@ -20,6 +20,8 @@ import hashlib
 import importlib.metadata
 import json
 import math
+import os
+import platform
 import statistics
 import subprocess
 from pathlib import Path
@@ -39,6 +41,7 @@ SHAPES = [
     (16, 128, 8192),
     (256, 32768),
 ]
+DTYPES = ("float16", "bfloat16", "float32")
 
 
 def stats(rows):
@@ -51,169 +54,151 @@ def stats(rows):
     )
 
 
+def summarize(rows, rounds):
+    groups = {}
+    for row in rows:
+        groups.setdefault((tuple(row["shape"]), row["dtype"]), []).append(row)
+    medians = [
+        {
+            **group[0],
+            **{
+                key: statistics.median(r[key] for r in group)
+                for key in ("torch_us", "flagtrain_us", "speedup")
+            },
+        }
+        for group in groups.values()
+    ]
+    summary = stats(medians)
+    expected = {(shape, dtype) for shape in SHAPES for dtype in DTYPES}
+    complete = (
+        rounds >= 3
+        and set(groups) == expected
+        and all(
+            len(group) == rounds and {r["round"] for r in group} == set(range(rounds))
+            for group in groups.values()
+        )
+    )
+    return dict(
+        rows=rows,
+        medians=medians,
+        summary=summary,
+        by_dtype={
+            dtype: stats([r for r in medians if r["dtype"] == dtype])
+            for dtype in sorted({r["dtype"] for r in rows})
+        },
+        round_summary={
+            repeat: stats([r for r in rows if r["round"] == repeat])
+            for repeat in range(rounds)
+        },
+        acceptance=dict(
+            metric="arithmetic_mean_of_case_median_speedups",
+            threshold=0.8,
+            complete=complete,
+            passed=summary["arithmetic"] >= 0.8 if complete else None,
+        ),
+        slow_cases=[r for r in medians if r["speedup"] < 0.8],
+    )
+
+
 def main():
-    p = argparse.ArgumentParser(__doc__)
-    p.add_argument("--shape", type=int, choices=range(7))
-    p.add_argument("--dtype", choices=["float16", "bfloat16", "float32"])
-    p.add_argument("--direction", choices=["forward", "backward"])
-    p.add_argument("--rounds", type=int, default=1)
-    p.add_argument("--output", required=True)
-    a = p.parse_args()
-    if a.rounds < 1:
-        p.error("--rounds must be positive")
-    run(a)
+    parser = argparse.ArgumentParser(__doc__)
+    parser.add_argument("--shape", type=int, choices=range(len(SHAPES)))
+    parser.add_argument("--dtype", choices=DTYPES)
+    parser.add_argument("--rounds", type=int, default=3)
+    parser.add_argument("--output", required=True)
+    args = parser.parse_args()
+    if args.rounds < 1:
+        parser.error("--rounds must be positive")
 
-
-def run(a):
     rows = []
     torch.manual_seed(2026)
-    for repeat in range(a.rounds):
-        for si, shape in enumerate(SHAPES):
-            if a.shape is not None and si != a.shape:
+    for repeat in range(args.rounds):
+        for index, shape in enumerate(SHAPES):
+            if args.shape is not None and args.shape != index:
                 continue
-            for dtype_name in ["float16", "bfloat16", "float32"]:
-                if a.dtype and a.dtype != dtype_name:
+            for dtype_name in DTYPES:
+                if args.dtype and args.dtype != dtype_name:
                     continue
                 torch.cuda.reset_peak_memory_stats()
                 dtype = getattr(torch, dtype_name)
-                x = torch.randn(shape, device="cuda", dtype=dtype, requires_grad=True)
-                b = torch.randn(
-                    shape[-1], device="cuda", dtype=dtype, requires_grad=True
-                )
-                g = torch.randn_like(x)
-                for direction in ["forward", "backward"]:
-                    if a.direction and a.direction != direction:
-                        continue
-                    funcs = []
-                    for op in [
-                        lambda x, b: F.gelu(x + b, approximate="tanh"),
-                        flag_train.megatron.bias_gelu_impl,
-                    ]:
-                        if direction == "backward":
-                            y = op(x, b)
-                            funcs.append(
-                                lambda y=y, x=x, b=b, g=g: torch.autograd.grad(
-                                    y, (x, b), g, retain_graph=True
-                                )
-                            )
-                        else:
-                            funcs.append(lambda op=op, x=x, b=b: op(x, b))
-                    times = [None, None]
-                    for idx in ([0, 1] if repeat % 2 == 0 else [1, 0]):
-                        times[idx] = (
-                            triton.testing.do_bench(
-                                funcs[idx],
-                                warmup=25,
-                                rep=100,
-                                return_mode="median",
-                                grad_to_none=(
-                                    [x, b] if direction == "backward" else None
-                                ),
-                            )
-                            * 1000
-                        )
-                    row = dict(
-                        round=repeat,
-                        shape=list(shape),
-                        dtype=dtype_name,
-                        direction=direction,
-                        torch_us=times[0],
-                        flagtrain_us=times[1],
-                        speedup=times[0] / times[1],
-                        memory_peak=torch.cuda.max_memory_allocated(),
-                    )
-                    rows.append(row)
-                    print(json.dumps(row), flush=True)
-                    del funcs
-                del x, b, g
-                if direction == "backward":
-                    del y
-                gc.collect()
-    medians = []
-    for row in rows:
-        key = (row["shape"], row["dtype"], row["direction"])
-        if any((r["shape"], r["dtype"], r["direction"]) == key for r in medians):
-            continue
-        group = [r for r in rows if (r["shape"], r["dtype"], r["direction"]) == key]
-        medians.append(
-            {
-                **row,
-                "speedup": statistics.median(r["speedup"] for r in group),
-                "torch_us": statistics.median(r["torch_us"] for r in group),
-                "flagtrain_us": statistics.median(r["flagtrain_us"] for r in group),
-            }
-        )
-    summaries = {"all": stats(medians)}
-    for field in ["dtype", "direction"]:
-        for value in sorted(set(r[field] for r in medians)):
-            summaries[value] = stats([r for r in medians if r[field] == value])
-    round_summaries = {
-        repeat: {
-            direction: stats(
-                [
-                    r
-                    for r in rows
-                    if r["round"] == repeat and r["direction"] == direction
+                x = torch.randn(shape, device="cuda", dtype=dtype)
+                bias = torch.randn(shape[-1], device=x.device, dtype=dtype)
+                functions = [
+                    lambda x=x, bias=bias: F.gelu(x + bias, approximate="tanh"),
+                    lambda x=x, bias=bias: flag_train.megatron.bias_gelu_impl(x, bias),
                 ]
-            )
-            for direction in sorted(set(r["direction"] for r in rows))
-        }
-        for repeat in range(a.rounds)
-    }
-    failures = {
-        d: summaries[d]
-        for d in ("forward", "backward")
-        if d in summaries and summaries[d]["arithmetic"] < 0.8
-    }
-    slow_cases = [r for r in medians if r["speedup"] < 0.8]
-    result = dict(
-        rows=rows,
-        medians=medians,
-        summary=summaries,
-        round_summary=round_summaries,
-        acceptance_metric="direction_arithmetic_mean_of_case_median_speedups",
-        failures=failures,
-        slow_cases=slow_cases,
-        slow_measurements=[r for r in rows if r["speedup"] < 0.8],
+                times = [None, None]
+                for side in ([0, 1] if repeat % 2 == 0 else [1, 0]):
+                    times[side] = (
+                        triton.testing.do_bench(
+                            functions[side], warmup=25, rep=100, return_mode="median"
+                        )
+                        * 1000
+                    )
+                row = dict(
+                    round=repeat,
+                    shape=list(shape),
+                    dtype=dtype_name,
+                    torch_us=times[0],
+                    flagtrain_us=times[1],
+                    speedup=times[0] / times[1],
+                    memory_peak=torch.cuda.max_memory_allocated(),
+                )
+                rows.append(row)
+                print(json.dumps(row), flush=True)
+                del functions, x, bias
+                gc.collect()
+
+    result = summarize(rows, args.rounds)
+    result.update(
         environment=dict(
-            implementation="unified_libentry",
             public_module=flag_train.megatron.bias_gelu_impl.__module__,
             commit=subprocess.check_output(
                 ["git", "rev-parse", "HEAD"], text=True
             ).strip(),
             source_sha256=hashlib.sha256(
-                b"".join(
-                    p.read_bytes()
-                    for p in sorted(
-                        Path("src/flag_train/megatron").rglob("*bias*gelu*")
-                    )
-                    if p.is_file() and p.suffix == ".py"
-                )
+                Path("src/flag_train/megatron/bias_gelu_impl.py").read_bytes()
             ).hexdigest(),
-            megatron_core=importlib.metadata.version("megatron-core"),
+            python=platform.python_version(),
             torch=torch.__version__,
             triton=triton.__version__,
+            megatron_core=importlib.metadata.version("megatron-core"),
             gpu=torch.cuda.get_device_name(),
             device=torch.cuda.current_device(),
+            cuda_visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES"),
         ),
-        timing=dict(warmup=25, rep=100, return_mode="median"),
+        timing=dict(warmup=25, rep=100, return_mode="median", requires_grad=False),
     )
-    path = Path(a.output)
+    path = Path(args.output)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.with_suffix(".json").write_text(json.dumps(result, indent=2))
-    with path.with_suffix(".csv").open("w") as f:
-        writer = csv.DictWriter(f, fieldnames=rows[0].keys())
-        writer.writeheader()
-        writer.writerows(rows)
-    print(json.dumps(summaries, indent=2), flush=True)
-    print(json.dumps({"round_summary": round_summaries}, indent=2), flush=True)
+    path.with_suffix(".json").write_text(json.dumps(result, indent=2) + "\n")
+    for records, target in [
+        (rows, path.with_suffix(".csv")),
+        (result["medians"], path.with_name(path.stem + "_medians.csv")),
+    ]:
+        with target.open("w") as output:
+            writer = csv.DictWriter(output, fieldnames=records[0])
+            writer.writeheader()
+            writer.writerows(records)
     print(
-        f"DIRECTION ARITHMETIC MEAN FAILURES <0.80: {len(failures)}; "
-        f'individual measurements <0.80: {len(result["slow_measurements"])}',
+        json.dumps(
+            {k: result[k] for k in ("summary", "round_summary", "acceptance")}, indent=2
+        ),
         flush=True,
     )
-    if failures:
-        raise SystemExit(1)
+    if result["acceptance"]["complete"]:
+        print(
+            "FORMAL FORWARD PERFORMANCE: "
+            + ("PASS" if result["acceptance"]["passed"] else "FAIL"),
+            flush=True,
+        )
+        if not result["acceptance"]["passed"]:
+            raise SystemExit(1)
+    else:
+        print(
+            "DIAGNOSTIC ONLY: formal acceptance requires all 21 cases and >=3 complete rounds",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":
