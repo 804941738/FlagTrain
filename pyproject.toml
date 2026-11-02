@@ -52,3 +52,6 @@ exclude-dependencies = [
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["flag_train*"]
+
+[tool.setuptools.package-data]
+"flag_train.megatron" = ["csrc/*.cpp", "csrc/*.cu"]

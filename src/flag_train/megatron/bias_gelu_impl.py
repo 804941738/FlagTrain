@@ -71,9 +71,24 @@ def _backward_block(n, dtype):
     return 1024 if n < (1 << 23) else 2048
 
 
+# Fixed configurations need no LibEntry tuning on NVIDIA. Use Triton's own
+# device/stream-aware JIT cache; retain framework dispatch for other backends.
+_forward_launch = _forward.fn if runtime_device.vendor_name == "nvidia" else _forward
+_backward_launch = _backward.fn if runtime_device.vendor_name == "nvidia" else _backward
+
+
 class _BiasGelu(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input, bias):
+        if input.ndim and bias.ndim == 1 and bias.numel() == input.shape[-1]:
+            x, b = input.contiguous(), bias.contiguous()
+            shape, h, mode = input.shape, bias.numel(), 1
+        else:
+            return _BiasGelu._broadcast_forward(ctx, input, bias)
+        return _BiasGelu._launch_forward(ctx, input, x, b, shape, h, mode)
+
+    @staticmethod
+    def _broadcast_forward(ctx, input, bias):
         x, b = torch.broadcast_tensors(input, bias)
         shape = x.shape
         x = x.contiguous()
@@ -91,13 +106,17 @@ class _BiasGelu(torch.autograd.Function):
             b, mode = bias.contiguous(), 1
         else:
             b, mode = b.contiguous(), 2
+        return _BiasGelu._launch_forward(ctx, input, x, b, shape, h, mode)
+
+    @staticmethod
+    def _launch_forward(ctx, input, x, b, shape, h, mode):
         ctx.save_for_backward(x, b)
         ctx.h, ctx.mode = h, mode
         out = torch.empty(shape, dtype=input.dtype, device=input.device)
         n = out.numel()
         if n:
             with torch_device_fn.device(input.device):
-                _forward[(triton.cdiv(n, 256),)](
+                _forward_launch[(triton.cdiv(n, 256),)](
                     x, b, out, n, h, mode, BLOCK=256, num_warps=4
                 )
         return out
@@ -111,7 +130,7 @@ class _BiasGelu(torch.autograd.Function):
         if n:
             block = _backward_block(n, x.dtype)
             with torch_device_fn.device(x.device):
-                _backward[(triton.cdiv(n, block),)](
+                _backward_launch[(triton.cdiv(n, block),)](
                     x,
                     b,
                     grad_output.contiguous(),
@@ -140,10 +159,25 @@ def bias_gelu_impl(input, bias):
             raise ValueError(f"{name} must be on the active accelerator")
     if input.dtype != bias.dtype or input.device != bias.device:
         raise ValueError("input and bias must have the same dtype and device")
-    try:
-        torch.broadcast_shapes(input.shape, bias.shape)
-    except RuntimeError:
-        raise ValueError(
-            "input and bias must have broadcast-compatible shapes"
-        ) from None
+    if not (input.ndim and bias.ndim == 1 and bias.numel() == input.shape[-1]):
+        try:
+            torch.broadcast_shapes(input.shape, bias.shape)
+        except RuntimeError:
+            raise ValueError(
+                "input and bias must have broadcast-compatible shapes"
+            ) from None
+    if (
+        runtime_device.vendor_name == "nvidia"
+        and input.ndim
+        and bias.ndim == 1
+        and bias.numel() == input.shape[-1]
+        and input.is_contiguous()
+        and bias.is_contiguous()
+        and 0 < input.numel() < (1 << 31)
+    ):
+        from ._bias_gelu_cuda import implementation
+
+        native = implementation()
+        if native is not None:
+            return native(input, bias)
     return _BiasGelu.apply(input, bias)
