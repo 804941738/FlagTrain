@@ -11,11 +11,13 @@ import json
 import math
 import statistics
 import subprocess
+from contextlib import nullcontext
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 import triton
+from bias_gelu_paths import generic_execution
 
 import flag_train
 
@@ -47,9 +49,17 @@ def main():
     p.add_argument("--direction", choices=["forward", "backward"])
     p.add_argument("--rounds", type=int, default=1)
     p.add_argument("--output", required=True)
+    p.add_argument(
+        "--implementation", choices=["default", "generic"], default="default"
+    )
     a = p.parse_args()
     if a.rounds < 1:
         p.error("--rounds must be positive")
+    with generic_execution() if a.implementation == "generic" else nullcontext():
+        run(a)
+
+
+def run(a):
     rows = []
     torch.manual_seed(2026)
     for repeat in range(a.rounds):
@@ -146,6 +156,8 @@ def main():
         slow_cases=slow_cases,
         below_hard_gate=[r for r in rows if r["speedup"] < 0.8],
         environment=dict(
+            implementation=a.implementation,
+            public_module=flag_train.megatron.bias_gelu_impl.__module__,
             commit=subprocess.check_output(
                 ["git", "rev-parse", "HEAD"], text=True
             ).strip(),
