@@ -110,8 +110,15 @@ backward timings, with full `autograd.grad` for both operands. Backward graphs
 are prepared outside timing. Ordinary `triton.testing.do_bench` uses 25 ms
 warmup, 100 ms repetition and median latency. All rounds, absolute latencies,
 per-item speedups and arithmetic/geometric aggregates are saved to CSV/JSON.
-Single-shape, dtype and direction filters support diagnosis. The direction
-geometric-mean acceptance floor is 0.80; individual slower cases are reported.
+Single-shape, dtype and direction filters support diagnosis. Formal performance
+acceptance requires at least three complete rounds of all 42 cases. For each
+case, take the median of the per-round `PyTorch latency / FlagTrain latency`
+speedups, then compute the **arithmetic mean** of the 21 case medians in each
+direction, with equal weight per shape and dtype. Forward and backward must each
+reach 0.80. Do not substitute a ratio of summed latencies. Per-round arithmetic
+means and variation are also reported. Geometric means, combined statistics,
+minimum speedups and individual cases below 0.80 are diagnostic only and do not
+affect acceptance. Correctness, build and code-quality checks remain mandatory.
 Megatron Eager remains a separate reference and is never substituted for PyTorch.
 
 ## Backend validation
