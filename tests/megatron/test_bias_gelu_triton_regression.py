@@ -119,3 +119,74 @@ def test_ascend_row_tiling_extremes(dtype, hidden):
                    device=flag_train.device, dtype=dtype)
     x[:, ::2] = -torch.finfo(dtype).max
     _check(x, torch.zeros(hidden, device=x.device, dtype=dtype))
+
+
+@pytest.mark.skipif(device.vendor_name != "ascend", reason="Ascend native dtype addition")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("bias_shape", [(), (4096,), (2, 4096)])
+def test_ascend_add_rounds_before_activation(dtype, bias_shape):
+    # A half-ULP tie at 1 must round to even *before* the activation. This
+    # deliberately distinguishes dtype-rounded addition from an FP32 fused add.
+    x = torch.ones((2, 4096), device=flag_train.device, dtype=dtype)
+    b = torch.full(bias_shape, torch.finfo(dtype).eps / 2, device=x.device, dtype=dtype)
+    y = flag_train.megatron.bias_gelu_impl(x, b).cpu()
+    z = (x.cpu() + b.cpu()).to(dtype).float()
+    ref = F.gelu(z, approximate="tanh").to(dtype)
+    unrounded = F.gelu(x.cpu().float() + b.cpu().float(), approximate="tanh").to(dtype)
+    assert not torch.equal(ref, unrounded)
+    torch.testing.assert_close(y, ref, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(device.vendor_name != "ascend", reason="Ascend native dtype addition")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_ascend_add_subnormals(dtype):
+    tiny = torch.finfo(dtype).tiny
+    values = [0, tiny / 128, -tiny / 128, tiny / 2, -tiny / 2, tiny, -tiny, 1]
+    x = torch.tensor(values, device=flag_train.device, dtype=dtype).repeat(2, 512)
+    b = torch.zeros(4096, device=x.device, dtype=dtype)
+    y = flag_train.megatron.bias_gelu_impl(x, b).cpu()
+    z = (x.cpu() + b.cpu()).to(dtype).float()
+    ref = (.5 * z * (1 + torch.tanh(.79788456 * z * (1 + .044715 * z * z)))).to(dtype)
+    torch.testing.assert_close(y, ref, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(device.vendor_name != "ascend", reason="Ascend stream/device guard")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_ascend_public_nondefault_stream(dtype):
+    stream = torch.npu.Stream()
+    with torch.npu.stream(stream):
+        x = torch.randn(2, 129, device=flag_train.device, dtype=dtype)
+        b = torch.randn(129, device=x.device, dtype=dtype)
+        y = flag_train.megatron.bias_gelu_impl(x, b)
+        assert torch.npu.current_stream().npu_stream == stream.npu_stream
+    stream.synchronize()
+    z = (x.cpu() + b.cpu()).to(dtype).float()
+    ref = F.gelu(z, approximate="tanh").to(dtype)
+    tol = {torch.float16: 3e-3, torch.bfloat16: 2e-2, torch.float32: 2e-5}[dtype]
+    torch.testing.assert_close(y.cpu(), ref, rtol=tol, atol=tol)
+
+
+@pytest.mark.skipif(device.vendor_name != "ascend", reason="Ascend stream/device guard")
+def test_ascend_guard_fallback(monkeypatch):
+    import importlib
+    module = importlib.import_module("flag_train.megatron.bias_gelu_impl")
+    current = module.torch_device_fn.current_device
+    guard = module.torch_device_fn.device
+    queries, guarded = [], []
+
+    def different_on_first_query():
+        queries.append(True)
+        # Force the operator's guarded branch without allocating on another NPU.
+        return -1 if len(queries) == 1 else current()
+
+    class RecordGuard(guard):
+        def __init__(self, device):
+            guarded.append(device)
+            super().__init__(device)
+
+    x = torch.randn(2, 129, device=flag_train.device)
+    monkeypatch.setattr(module.torch_device_fn, "current_device", different_on_first_query)
+    monkeypatch.setattr(module.torch_device_fn, "device", RecordGuard)
+    _check(x, torch.zeros(129, device=x.device))
+    assert guarded == [x.device]
+    assert torch.npu.current_device() == x.device.index

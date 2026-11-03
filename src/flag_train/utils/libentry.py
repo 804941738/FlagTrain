@@ -1459,6 +1459,21 @@ class LibEntry(triton.KernelInterface):
         else:
             self.lock = multiprocessing.Lock()
         self.signature = fn.signature
+        self._ascend_plain_jit = (
+            runtime.device.vendor_name == "ascend"
+            and isinstance(self.fn, triton.runtime.JITFunction)
+            and major_version == 3
+            and 3 <= minor_version <= 6
+        )
+        self._ascend_raw_stream = None
+        if self._ascend_plain_jit:
+            import torch_npu
+
+            self._ascend_raw_stream = getattr(
+                torch_npu._C, "_npu_getCurrentRawStreamNoWait", None
+            )
+        self._constexpr_indices = tuple(p.num for p in fn.params if p.is_constexpr)
+        self._argument_defaults = tuple((p.name, p.default) for p in fn.params)
 
     @staticmethod
     def _contains_flagtune_tuner(fn):
@@ -1518,6 +1533,15 @@ class LibEntry(triton.KernelInterface):
         # const args passed by position
         const_key = tuple(_descriptor_cache_key(arg) for arg in const_args)
 
+        if runtime.device.vendor_name == "ascend":
+            # Ascend specialization depends on dtype/alignment, not allocation
+            # size or pointer identity. Avoid computing a larger memo signature
+            # (including storage queries) before constructing this cheap key.
+            return tuple(
+                _spec_arg(_descriptor_cache_key(arg), self.divisibility)
+                for arg in spec_args
+            ) + dns_key + const_key
+
         # Rebuilding the key from scratch is most of the optimizer step's host
         # time on a Hygon DCU.  The signature is cheap, and by construction of
         # _spec_signature it determines the key exactly, so a hit can skip the
@@ -1541,7 +1565,58 @@ class LibEntry(triton.KernelInterface):
             cache[signature] = entry_key
         return entry_key
 
+    def _ascend_cache_hit(self, args, kwargs):
+        """Bind a plain JIT call without tuner dictionaries on an Ascend hit.
+
+        Compilation, cache ownership, specialization and the compiled runner
+        remain the normal LibEntry path. Rebind tensors and query the runner's
+        current stream on every call; no output or launch arguments are cached.
+        """
+        grid = kwargs.get("grid")
+        if not isinstance(grid, tuple) or len(args) > len(self._argument_defaults):
+            return None
+        values = list(args)
+        for name, default in self._argument_defaults[len(args):]:
+            value = kwargs.get(name, default)
+            if value is inspect._empty:
+                return None
+            values.append(value)
+        entry_key = self.key(
+            [values[i] for i in self.specialize_indices],
+            [values[i] for i in self.do_not_specialize_indices],
+            [values[i] for i in self._constexpr_indices],
+        )
+        device_index = torch_device_fn.current_device()
+        cached = self.kernel_cache[device_index].get(entry_key)
+        if cached is None:
+            return None
+        kernel, constexprs, _, _, _ = cached
+        grid = (grid + (1, 1))[:3]
+        if (
+            minor_version == 5 and _triton_knobs is not None
+            and self._ascend_raw_stream is not None
+        ):
+            # Same call contract as CompiledKernel.__getitem__ in Triton 3.5,
+            # without a temporary runner closure or repeated registry lookup.
+            # Keep NPULauncher (debug/profiling) and dynamic launch hooks intact.
+            # Match the torch_npu backend's NoWait query: constructing a Python
+            # Stream can flush the task queue and defeats asynchronous submission.
+            stream = self._ascend_raw_stream(device_index)
+            metadata = kernel.launch_metadata(grid, stream, *values)
+            kernel.run(
+                *grid, stream, kernel.function, kernel.packed_metadata, metadata,
+                _triton_knobs.runtime.launch_enter_hook,
+                _triton_knobs.runtime.launch_exit_hook, *values,
+            )
+        else:
+            kernel[grid](*values)
+        return kernel, constexprs
+
     def run(self, *args, **kwargs):
+        if self._ascend_plain_jit:
+            cached_result = self._ascend_cache_hit(args, kwargs)
+            if cached_result is not None:
+                return cached_result
         grid = kwargs["grid"]
         if self._has_flagtune_tuner:
             self._apply_flagtune()

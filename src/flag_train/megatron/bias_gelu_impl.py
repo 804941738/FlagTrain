@@ -17,6 +17,8 @@ Bias addition rounds to the operand dtype before FP32 activation arithmetic.
 The output is a plain tensor: this operator does not propagate gradients.
 """
 
+from contextlib import nullcontext
+
 import torch
 import triton
 import triton.language as tl
@@ -36,7 +38,8 @@ if _IS_ASCEND:
 
 @triton.jit
 def _bias_gelu_tile(
-    X, B, Y, N, H: tl.constexpr, BIAS_MODE: tl.constexpr, BLOCK: tl.constexpr, tile, ROWWISE: tl.constexpr, EVEN: tl.constexpr
+    X, B, Y, N, H: tl.constexpr, BIAS_MODE: tl.constexpr, BLOCK: tl.constexpr,
+    tile, ROWWISE: tl.constexpr, EVEN: tl.constexpr,
 ):
     if ROWWISE and BIAS_MODE == 1 and not (H <= BLOCK and H & (H - 1) == 0):
         # Explicitly contiguous bias columns avoid Ascend's scalar gather
@@ -49,22 +52,34 @@ def _bias_gelu_tile(
         mask = offsets < N
     if EVEN:
         mask = True
-    x = tl.load(X + offsets, mask, other=0).to(tl.float32)
+    x = tl.load(X + offsets, mask, other=0)
     if BIAS_MODE == 0:
-        b = tl.load(B).to(tl.float32)
+        b = tl.load(B)
     elif BIAS_MODE == 1:
         if ROWWISE and H <= BLOCK and H & (H - 1) == 0:
-            row = tl.load(B + tl.arange(0, H)).to(tl.float32)
+            row = tl.load(B + tl.arange(0, H))
             b = tl.broadcast_to(row[None, :], (BLOCK // H, H)).reshape((BLOCK,))
         elif ROWWISE:
-            b = tl.load(B + columns, mask, other=0).to(tl.float32)
+            b = tl.load(B + columns, mask, other=0)
         else:
-            b = tl.load(B + offsets % H, mask, other=0).to(tl.float32)
+            b = tl.load(B + offsets % H, mask, other=0)
     else:
-        b = tl.load(B + offsets, mask, other=0).to(tl.float32)
+        b = tl.load(B + offsets, mask, other=0)
+    if not ROWWISE or X.dtype.element_ty != tl.float16:
+        # Only FP16 native addition preserves the tested rounding contract.
+        # Ascend BF16 legalization can retain an unrounded FP32 intermediate;
+        # keep its explicit FP32 -> BF16 -> FP32 rounding barrier.
+        # The established non-Ascend path, including tiny rows, is unchanged.
+        x = x.to(tl.float32)
+        b = b.to(tl.float32)
     # Match the standalone dtype-rounded add, rather than fusing an FP32 add.
     z = (x + b).to(X.dtype.element_ty).to(tl.float32)
-    t = tl_extra_shim.tanh(0.79788456 * z * (1.0 + 0.044715 * z * z))
+    if ROWWISE and X.dtype.element_ty != tl.float32:
+        # Same cubic, factored to remove one FP32 vector multiplication.
+        argument = (0.79788456 + (0.79788456 * 0.044715) * z * z) * z
+    else:
+        argument = 0.79788456 * z * (1.0 + 0.044715 * z * z)
+    t = tl_extra_shim.tanh(argument)
     tl.store(Y + offsets, 0.5 * z * (1.0 + t), mask)
 
 
@@ -95,14 +110,18 @@ def bias_gelu_impl(input, bias):
     The result is contiguous, with the broadcast shape and operand dtype.
     Invalid types raise TypeError; invalid dtype, device or shapes raise ValueError.
     """
+    metadata = []
     for name, tensor in (("input", input), ("bias", bias)):
         if not isinstance(tensor, torch.Tensor):
             raise TypeError(f"{name} must be a tensor")
-        if tensor.dtype not in _DTYPES:
+        dtype, device = tensor.dtype, tensor.device
+        if dtype not in _DTYPES:
             raise ValueError(f"{name} must have FP16, BF16 or FP32 dtype")
-        if tensor.device.type != runtime_device.name or tensor.device.type == "cpu":
+        if device.type != runtime_device.name or device.type == "cpu":
             raise ValueError(f"{name} must be on the active accelerator")
-    if input.dtype != bias.dtype or input.device != bias.device:
+        metadata.append((dtype, device))
+    (input_dtype, input_device), (bias_dtype, bias_device) = metadata
+    if input_dtype != bias_dtype or input_device != bias_device:
         raise ValueError("input and bias must have the same dtype and device")
 
     vector_bias = input.ndim and bias.ndim == 1 and bias.numel() == input.shape[-1]
@@ -115,7 +134,10 @@ def bias_gelu_impl(input, bias):
             raise ValueError(
                 "input and bias must have broadcast-compatible shapes"
             ) from None
-    out = torch.empty(x.shape, dtype=input.dtype, device=input.device)
+    out = (
+        input.new_empty(x.shape) if _IS_ASCEND
+        else torch.empty(x.shape, dtype=input_dtype, device=input_device)
+    )
     n = x.numel()
     if not n:
         return out
@@ -131,14 +153,38 @@ def bias_gelu_impl(input, bias):
     else:
         b, mode = b.contiguous(), 2
     x = x.contiguous()
-    block = (
-        min(16384, max(128, triton.next_power_of_2(triton.cdiv(n, 40))))
-    ) if _IS_ASCEND else _BLOCK_SIZE
-    tiles = (n // h) * triton.cdiv(h, block) if _IS_ASCEND and mode == 1 and h >= 128 and not (h <= block and h & (h - 1) == 0) else triton.cdiv(n, block)
-    grid = (min(tiles, CORE_NUM) if _IS_ASCEND else tiles,)
-    with torch_device_fn.device(input.device):
+    if _IS_ASCEND:
+        # FlagTree wraps its integer helpers in JIT dispatch; these launch
+        # dimensions are host integers and need only ordinary Python arithmetic.
+        lanes = (n + CORE_NUM - 1) // CORE_NUM
+        block = min(16384, max(128, 1 << (lanes - 1).bit_length()))
+        # Low-precision non-power-of-two rows can waste nearly half a large
+        # tile (e.g. H=11008). A 4096-lane tile reduces masked UB work.
+        if (
+            input_dtype != torch.float32 and mode == 1 and h >= 128
+            and block > 4096 and not (h <= block and h & (h - 1) == 0)
+            and ((h + block - 1) // block) * block * 8 > h * 9
+        ):
+            block = 4096
+        if mode == 1 and h >= 128 and not (h <= block and h & (h - 1) == 0):
+            tiles = (n // h) * ((h + block - 1) // block)
+        else:
+            tiles = (n + block - 1) // block
+        grid = (min(tiles, CORE_NUM),)
+    else:
+        block = _BLOCK_SIZE
+        grid = (triton.cdiv(n, block),)
+    # A tensor on the current NPU needs no device exchange. Keep the guard for
+    # cross-device calls and leave every non-Ascend launch on its original path.
+    context = (
+        nullcontext()
+        if _IS_ASCEND and torch_device_fn.current_device() == input_device.index
+        else torch_device_fn.device(input_device)
+    )
+    with context:
         _bias_gelu_forward_kernel[grid](
-            x, b, out, n, h, mode, BLOCK=block, PERSISTENT=_IS_ASCEND, num_warps=_NUM_WARPS,
+            x, b, out, n, h, mode, BLOCK=block, PERSISTENT=_IS_ASCEND,
+            num_warps=_NUM_WARPS,
             EVEN=_IS_ASCEND and n % block == 0 and (mode != 1 or h % block == 0),
             **({"num_stages": 1} if _IS_ASCEND else {}),
         )
