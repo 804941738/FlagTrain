@@ -109,8 +109,15 @@ def test_bias_gelu_bad_arguments():
         with pytest.raises(TypeError, match="tensor"):
             flag_train.megatron.bias_gelu_impl(a, b)
     for dtype in [torch.int32, torch.float64, torch.bool]:
+        # torch_npu silently casts requested FP64 to FP32. Keep a real FP64
+        # operand on CPU: dtype validation deliberately precedes device checks.
+        invalid = (
+            x.cpu().to(dtype)
+            if flag_train.vendor_name == "ascend" and dtype == torch.float64
+            else x.to(dtype)
+        )
         with pytest.raises(ValueError, match="dtype"):
-            flag_train.megatron.bias_gelu_impl(x, x.to(dtype))
+            flag_train.megatron.bias_gelu_impl(x, invalid)
     with pytest.raises(ValueError, match="same dtype"):
         flag_train.megatron.bias_gelu_impl(x, x.to(torch.float16))
     for a, b in [(x, torch.randn(8)), (torch.randn(4, 8), x)]:

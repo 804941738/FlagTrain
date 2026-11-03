@@ -92,3 +92,30 @@ def test_single_row_large_hidden_grid():
     b = torch.zeros(hidden, device=x.device, dtype=x.dtype)
     y = flag_train.megatron.bias_gelu_impl(x, b)
     assert y.shape == x.shape and torch.all(y == 0)
+
+
+@pytest.mark.skipif(device.vendor_name != "ascend", reason="Ascend coreDim regression")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("n", [65535 * 256 - 1, 65535 * 256, 65535 * 256 + 1, (1 << 26) + 1])
+def test_ascend_grid_boundaries(n, dtype):
+    # Nonzero random data detects missing/repeated tiles, including the last lane.
+    torch.manual_seed(910)
+    x = torch.randn(n, device=flag_train.device, dtype=dtype)
+    b = torch.tensor(0.125, device=x.device, dtype=dtype)
+    y = flag_train.megatron.bias_gelu_impl(x, b)
+    tolerance = {torch.float16: 3e-3, torch.bfloat16: 2e-2, torch.float32: 2e-5}[dtype]
+    for start in range(0, n, 1 << 20):
+        z = (x[start:start + (1 << 20)].cpu() + b.cpu()).to(dtype).double()
+        ref = (0.5 * z * (1 + torch.tanh(0.79788456 * z * (1 + 0.044715 * z * z)))).to(dtype)
+        torch.testing.assert_close(y[start:start + (1 << 20)].cpu(), ref,
+                                   rtol=tolerance, atol=tolerance)
+
+
+@pytest.mark.skipif(device.vendor_name != "ascend", reason="Ascend row tiling regression")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("hidden", [128, 4096, 11008])
+def test_ascend_row_tiling_extremes(dtype, hidden):
+    x = torch.full((2, hidden), torch.finfo(dtype).max,
+                   device=flag_train.device, dtype=dtype)
+    x[:, ::2] = -torch.finfo(dtype).max
+    _check(x, torch.zeros(hidden, device=x.device, dtype=dtype))
