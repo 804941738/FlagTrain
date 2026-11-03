@@ -79,8 +79,15 @@ def _bias_gelu_tile(
         argument = (0.79788456 + (0.79788456 * 0.044715) * z * z) * z
     else:
         argument = 0.79788456 * z * (1.0 + 0.044715 * z * z)
-    t = tl_extra_shim.tanh(argument)
-    tl.store(Y + offsets, 0.5 * z * (1.0 + t), mask)
+    if ROWWISE:
+        # 0.5*z*(1+tanh(u)) == z/(1+exp(-2*u)). Fuse the activation
+        # epilogue, retaining the FP32 calculation and the dtype rounding above.
+        # Multiply by the reciprocal to preserve the original tiny-value path.
+        result = z * (1.0 / (1.0 + tl.exp(-2.0 * argument)))
+    else:
+        t = tl_extra_shim.tanh(argument)
+        result = 0.5 * z * (1.0 + t)
+    tl.store(Y + offsets, result, mask)
 
 
 @libentry()
@@ -182,10 +189,19 @@ def bias_gelu_impl(input, bias):
         else torch_device_fn.device(input_device)
     )
     with context:
-        _bias_gelu_forward_kernel[grid](
-            x, b, out, n, h, mode, BLOCK=block, PERSISTENT=_IS_ASCEND,
-            num_warps=_NUM_WARPS,
-            EVEN=_IS_ASCEND and n % block == 0 and (mode != 1 or h % block == 0),
-            **({"num_stages": 1} if _IS_ASCEND else {}),
-        )
+        if _IS_ASCEND:
+            # Same LibEntry.run path as kernel[grid], without its temporary
+            # closure/dict merge. warmup=False is required on cold JIT misses.
+            _bias_gelu_forward_kernel.run(
+                x, b, out, n, h, mode, grid=grid, warmup=False, BLOCK=block,
+                PERSISTENT=True, num_warps=_NUM_WARPS, num_stages=1,
+                EVEN=n % block == 0 and (mode != 1 or h % block == 0),
+            )
+        else:
+            _bias_gelu_forward_kernel[grid](
+                x, b, out, n, h, mode, BLOCK=block, PERSISTENT=_IS_ASCEND,
+                num_warps=_NUM_WARPS,
+                EVEN=_IS_ASCEND and n % block == 0 and (mode != 1 or h % block == 0),
+                **({"num_stages": 1} if _IS_ASCEND else {}),
+            )
     return out

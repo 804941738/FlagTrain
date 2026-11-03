@@ -190,3 +190,28 @@ def test_ascend_guard_fallback(monkeypatch):
     _check(x, torch.zeros(129, device=x.device))
     assert guarded == [x.device]
     assert torch.npu.current_device() == x.device.index
+
+
+@pytest.mark.skipif(device.vendor_name != "ascend", reason="Ascend activation epilogue")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_ascend_activation_dense_curve(dtype):
+    x = torch.linspace(-20, 20, 4097, dtype=dtype, device=flag_train.device).repeat(2, 1)
+    for shape in [(), (4097,), x.shape]:
+        _check(x, torch.zeros(shape, device=x.device, dtype=dtype))
+
+
+@pytest.mark.skipif(device.vendor_name != "ascend", reason="Ascend activation epilogue")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_ascend_activation_special_values(dtype):
+    limit, tiny = torch.finfo(dtype).max, torch.finfo(dtype).tiny
+    values = [float("inf"), -float("inf"), float("nan"), limit, -limit,
+              0., -0., tiny / 128, -tiny / 128, tiny / 2, -tiny / 2, -3., 3.]
+    x = torch.tensor(values, dtype=dtype, device=flag_train.device).repeat(2, 512)
+    for shape in [(), (x.shape[-1],), x.shape]:
+        b = torch.zeros(shape, device=x.device, dtype=dtype)
+        y = flag_train.megatron.bias_gelu_impl(x, b).cpu()
+        z = (x.cpu() + b.cpu()).to(dtype).double()
+        ref = (.5 * z * (1 + torch.tanh(.79788456 * z * (1 + .044715 * z * z)))).to(dtype)
+        assert torch.equal(torch.isnan(y), torch.isnan(ref))
+        tol = {torch.float16: 3e-3, torch.bfloat16: 2e-2, torch.float32: 2e-5}[dtype]
+        torch.testing.assert_close(y, ref, rtol=tol, atol=tol, equal_nan=True)
