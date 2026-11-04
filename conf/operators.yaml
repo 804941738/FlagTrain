@@ -173,6 +173,20 @@ ops:
   source: deepspeed.ops.op_builder.FusedLambBuilder
   stages:
   - beta: '0.0.0'
+- id: mixed_gemm
+  description: Mixed-precision GEMM with weight-only integer quantization.
+  for:
+  - mixed_gemm
+  labels:
+  - deepspeed
+  - gemm
+  - quantization
+  from:
+  - deepspeed
+  kind:
+  - Quantization
+  stages:
+  - beta: '0.0.0'
 - id: mixed_moe_gemm
   description: Grouped GEMM for mixed-precision MoE experts.
   for:
