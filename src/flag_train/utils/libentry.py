@@ -1537,10 +1537,14 @@ class LibEntry(triton.KernelInterface):
             # Ascend specialization depends on dtype/alignment, not allocation
             # size or pointer identity. Avoid computing a larger memo signature
             # (including storage queries) before constructing this cheap key.
-            return tuple(
-                _spec_arg(_descriptor_cache_key(arg), self.divisibility)
-                for arg in spec_args
-            ) + dns_key + const_key
+            return (
+                tuple(
+                    _spec_arg(_descriptor_cache_key(arg), self.divisibility)
+                    for arg in spec_args
+                )
+                + dns_key
+                + const_key
+            )
 
         # Rebuilding the key from scratch is most of the optimizer step's host
         # time on a Hygon DCU.  The signature is cheap, and by construction of
@@ -1576,7 +1580,7 @@ class LibEntry(triton.KernelInterface):
         if not isinstance(grid, tuple) or len(args) > len(self._argument_defaults):
             return None
         values = list(args)
-        for name, default in self._argument_defaults[len(args):]:
+        for name, default in self._argument_defaults[len(args) :]:
             value = kwargs.get(name, default)
             if value is inspect._empty:
                 return None
@@ -1593,7 +1597,8 @@ class LibEntry(triton.KernelInterface):
         kernel, constexprs, _, _, _ = cached
         grid = (grid + (1, 1))[:3]
         if (
-            minor_version == 5 and _triton_knobs is not None
+            minor_version == 5
+            and _triton_knobs is not None
             and self._ascend_raw_stream is not None
         ):
             # Same call contract as CompiledKernel.__getitem__ in Triton 3.5,
@@ -1604,9 +1609,14 @@ class LibEntry(triton.KernelInterface):
             stream = self._ascend_raw_stream(device_index)
             metadata = kernel.launch_metadata(grid, stream, *values)
             kernel.run(
-                *grid, stream, kernel.function, kernel.packed_metadata, metadata,
+                *grid,
+                stream,
+                kernel.function,
+                kernel.packed_metadata,
+                metadata,
                 _triton_knobs.runtime.launch_enter_hook,
-                _triton_knobs.runtime.launch_exit_hook, *values,
+                _triton_knobs.runtime.launch_exit_hook,
+                *values,
             )
         else:
             kernel[grid](*values)

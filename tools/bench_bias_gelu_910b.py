@@ -27,8 +27,8 @@ import subprocess
 from pathlib import Path
 
 import torch
-import torch_npu
 import torch.nn.functional as F
+import torch_npu
 import triton
 
 import flag_train
@@ -172,30 +172,48 @@ def main():
                 ["git", "rev-parse", "HEAD"], text=True
             ).strip(),
             measured_sources_dirty=subprocess.run(
-                ["git", "diff", "--quiet", "HEAD", "--",
-                 "src/flag_train/megatron/bias_gelu_impl.py",
-                 "src/flag_train/utils/libentry.py", "tools/bench_bias_gelu_910b.py"],
+                [
+                    "git",
+                    "diff",
+                    "--quiet",
+                    "HEAD",
+                    "--",
+                    "src/flag_train/megatron/bias_gelu_impl.py",
+                    "src/flag_train/utils/libentry.py",
+                    "tools/bench_bias_gelu_910b.py",
+                ],
                 check=False,
-            ).returncode != 0,
+            ).returncode
+            != 0,
             source_sha256=hashlib.sha256(
                 Path("src/flag_train/megatron/bias_gelu_impl.py").read_bytes()
             ).hexdigest(),
             libentry_source_sha256=hashlib.sha256(
                 Path("src/flag_train/utils/libentry.py").read_bytes()
             ).hexdigest(),
-            benchmark_source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            benchmark_source_sha256=hashlib.sha256(
+                Path(__file__).read_bytes()
+            ).hexdigest(),
             python=platform.python_version(),
             torch=torch.__version__,
             triton=triton.__version__,
-
             gpu=torch.npu.get_device_name(),
             torch_npu=torch_npu.__version__,
             flagtree=importlib.metadata.version("flagtree"),
-            cann=Path("/usr/local/Ascend/cann/share/info/runtime/version.info").read_text(),
+            cann=Path(
+                "/usr/local/Ascend/cann/share/info/runtime/version.info"
+            ).read_text(),
             device=torch.npu.current_device(),
             ascend_visible_devices=os.environ.get("ASCEND_RT_VISIBLE_DEVICES"),
         ),
-        timing=dict(method="NPU Event batch latency", warmup=25, batches=11, iterations=100, return_mode="median", requires_grad=False),
+        timing=dict(
+            method="NPU Event batch latency",
+            warmup=25,
+            batches=11,
+            iterations=100,
+            return_mode="median",
+            requires_grad=False,
+        ),
     )
     path = Path(args.output)
     path.parent.mkdir(parents=True, exist_ok=True)

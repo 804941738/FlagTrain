@@ -38,8 +38,16 @@ if _IS_ASCEND:
 
 @triton.jit
 def _bias_gelu_tile(
-    X, B, Y, N, H: tl.constexpr, BIAS_MODE: tl.constexpr, BLOCK: tl.constexpr,
-    tile, ROWWISE: tl.constexpr, EVEN: tl.constexpr,
+    X,
+    B,
+    Y,
+    N,
+    H: tl.constexpr,
+    BIAS_MODE: tl.constexpr,
+    BLOCK: tl.constexpr,
+    tile,
+    ROWWISE: tl.constexpr,
+    EVEN: tl.constexpr,
 ):
     if ROWWISE and BIAS_MODE == 1 and not (H <= BLOCK and H & (H - 1) == 0):
         # Explicitly contiguous bias columns avoid Ascend's scalar gather
@@ -93,8 +101,15 @@ def _bias_gelu_tile(
 @libentry()
 @triton.jit
 def _bias_gelu_forward_kernel(
-    X, B, Y, N, H: tl.constexpr, BIAS_MODE: tl.constexpr, BLOCK: tl.constexpr,
-    PERSISTENT: tl.constexpr = False, EVEN: tl.constexpr = False,
+    X,
+    B,
+    Y,
+    N,
+    H: tl.constexpr,
+    BIAS_MODE: tl.constexpr,
+    BLOCK: tl.constexpr,
+    PERSISTENT: tl.constexpr = False,
+    EVEN: tl.constexpr = False,
 ):
     if PERSISTENT:
         # Bound physical programs to vector cores; stride over arbitrarily many
@@ -142,7 +157,8 @@ def bias_gelu_impl(input, bias):
                 "input and bias must have broadcast-compatible shapes"
             ) from None
     out = (
-        input.new_empty(x.shape) if _IS_ASCEND
+        input.new_empty(x.shape)
+        if _IS_ASCEND
         else torch.empty(x.shape, dtype=input_dtype, device=input_device)
     )
     n = x.numel()
@@ -168,8 +184,11 @@ def bias_gelu_impl(input, bias):
         # Low-precision non-power-of-two rows can waste nearly half a large
         # tile (e.g. H=11008). A 4096-lane tile reduces masked UB work.
         if (
-            input_dtype != torch.float32 and mode == 1 and h >= 128
-            and block > 4096 and not (h <= block and h & (h - 1) == 0)
+            input_dtype != torch.float32
+            and mode == 1
+            and h >= 128
+            and block > 4096
+            and not (h <= block and h & (h - 1) == 0)
             and ((h + block - 1) // block) * block * 8 > h * 9
         ):
             block = 4096
@@ -193,13 +212,30 @@ def bias_gelu_impl(input, bias):
             # Same LibEntry.run path as kernel[grid], without its temporary
             # closure/dict merge. warmup=False is required on cold JIT misses.
             _bias_gelu_forward_kernel.run(
-                x, b, out, n, h, mode, grid=grid, warmup=False, BLOCK=block,
-                PERSISTENT=True, num_warps=_NUM_WARPS, num_stages=1,
+                x,
+                b,
+                out,
+                n,
+                h,
+                mode,
+                grid=grid,
+                warmup=False,
+                BLOCK=block,
+                PERSISTENT=True,
+                num_warps=_NUM_WARPS,
+                num_stages=1,
                 EVEN=n % block == 0 and (mode != 1 or h % block == 0),
             )
         else:
             _bias_gelu_forward_kernel[grid](
-                x, b, out, n, h, mode, BLOCK=block, PERSISTENT=_IS_ASCEND,
+                x,
+                b,
+                out,
+                n,
+                h,
+                mode,
+                BLOCK=block,
+                PERSISTENT=_IS_ASCEND,
                 num_warps=_NUM_WARPS,
                 EVEN=_IS_ASCEND and n % block == 0 and (mode != 1 or h % block == 0),
                 **({"num_stages": 1} if _IS_ASCEND else {}),

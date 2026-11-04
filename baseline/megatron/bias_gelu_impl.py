@@ -3,7 +3,6 @@
 """Native eager Megatron baseline; unavailable dependencies raise, never fallback.
 
 Forward collection uses the same shapes/dtypes as the GenericBenchmark module.
-Backward timing is provided by GenericBenchmark's is_backward path.
 """
 
 import importlib

@@ -1,6 +1,7 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
 """Ascend cache-hit dispatch: fresh operands, specialization and stream state."""
+
 import importlib
 
 import pytest
@@ -12,14 +13,18 @@ import flag_train
 from flag_train.utils import libentry
 
 module = importlib.import_module("flag_train.utils.libentry")
-pytestmark = pytest.mark.skipif(flag_train.vendor_name != "ascend", reason="Ascend dispatch")
+pytestmark = pytest.mark.skipif(
+    flag_train.vendor_name != "ascend", reason="Ascend dispatch"
+)
 
 
 @libentry()
 @triton.jit
 def _copy_scaled(X, Y, N, SCALE: tl.constexpr = 1, BLOCK: tl.constexpr = 128):
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    tl.store(Y + offsets, tl.load(X + offsets, offsets < N, other=0) * SCALE, offsets < N)
+    tl.store(
+        Y + offsets, tl.load(X + offsets, offsets < N, other=0) * SCALE, offsets < N
+    )
 
 
 @pytest.mark.parametrize("fast", [False, True])
@@ -140,14 +145,19 @@ def test_enter_and_exit_hooks_are_forwarded(monkeypatch):
     y = torch.empty_like(x)
     _copy_scaled[(2,)](x, y, 129)
     seen = []
-    monkeypatch.setattr(module._triton_knobs.runtime, "launch_enter_hook",
-                        lambda metadata: seen.append("enter"))
-    monkeypatch.setattr(module._triton_knobs.runtime, "launch_exit_hook",
-                        lambda metadata: seen.append("exit"))
+    monkeypatch.setattr(
+        module._triton_knobs.runtime,
+        "launch_enter_hook",
+        lambda metadata: seen.append("enter"),
+    )
+    monkeypatch.setattr(
+        module._triton_knobs.runtime,
+        "launch_exit_hook",
+        lambda metadata: seen.append("exit"),
+    )
     _copy_scaled[(2,)](x, y, 129)
     torch.testing.assert_close(y.cpu(), x.cpu())
     assert seen == ["enter", "exit"]
-
 
 
 def test_missing_nowait_capability_uses_compiled_runner(monkeypatch):

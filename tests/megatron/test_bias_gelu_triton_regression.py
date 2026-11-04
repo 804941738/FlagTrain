@@ -96,7 +96,9 @@ def test_single_row_large_hidden_grid():
 
 @pytest.mark.skipif(device.vendor_name != "ascend", reason="Ascend coreDim regression")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("n", [65535 * 256 - 1, 65535 * 256, 65535 * 256 + 1, (1 << 26) + 1])
+@pytest.mark.parametrize(
+    "n", [65535 * 256 - 1, 65535 * 256, 65535 * 256 + 1, (1 << 26) + 1]
+)
 def test_ascend_grid_boundaries(n, dtype):
     # Nonzero random data detects missing/repeated tiles, including the last lane.
     torch.manual_seed(910)
@@ -105,23 +107,31 @@ def test_ascend_grid_boundaries(n, dtype):
     y = flag_train.megatron.bias_gelu_impl(x, b)
     tolerance = {torch.float16: 3e-3, torch.bfloat16: 2e-2, torch.float32: 2e-5}[dtype]
     for start in range(0, n, 1 << 20):
-        z = (x[start:start + (1 << 20)].cpu() + b.cpu()).to(dtype).double()
-        ref = (0.5 * z * (1 + torch.tanh(0.79788456 * z * (1 + 0.044715 * z * z)))).to(dtype)
-        torch.testing.assert_close(y[start:start + (1 << 20)].cpu(), ref,
-                                   rtol=tolerance, atol=tolerance)
+        z = (x[start : start + (1 << 20)].cpu() + b.cpu()).to(dtype).double()
+        ref = (0.5 * z * (1 + torch.tanh(0.79788456 * z * (1 + 0.044715 * z * z)))).to(
+            dtype
+        )
+        torch.testing.assert_close(
+            y[start : start + (1 << 20)].cpu(), ref, rtol=tolerance, atol=tolerance
+        )
 
 
-@pytest.mark.skipif(device.vendor_name != "ascend", reason="Ascend row tiling regression")
+@pytest.mark.skipif(
+    device.vendor_name != "ascend", reason="Ascend row tiling regression"
+)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("hidden", [128, 4096, 11008])
 def test_ascend_row_tiling_extremes(dtype, hidden):
-    x = torch.full((2, hidden), torch.finfo(dtype).max,
-                   device=flag_train.device, dtype=dtype)
+    x = torch.full(
+        (2, hidden), torch.finfo(dtype).max, device=flag_train.device, dtype=dtype
+    )
     x[:, ::2] = -torch.finfo(dtype).max
     _check(x, torch.zeros(hidden, device=x.device, dtype=dtype))
 
 
-@pytest.mark.skipif(device.vendor_name != "ascend", reason="Ascend native dtype addition")
+@pytest.mark.skipif(
+    device.vendor_name != "ascend", reason="Ascend native dtype addition"
+)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("bias_shape", [(), (4096,), (2, 4096)])
 def test_ascend_add_rounds_before_activation(dtype, bias_shape):
@@ -137,7 +147,9 @@ def test_ascend_add_rounds_before_activation(dtype, bias_shape):
     torch.testing.assert_close(y, ref, rtol=0, atol=0)
 
 
-@pytest.mark.skipif(device.vendor_name != "ascend", reason="Ascend native dtype addition")
+@pytest.mark.skipif(
+    device.vendor_name != "ascend", reason="Ascend native dtype addition"
+)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_ascend_add_subnormals(dtype):
     tiny = torch.finfo(dtype).tiny
@@ -146,7 +158,9 @@ def test_ascend_add_subnormals(dtype):
     b = torch.zeros(4096, device=x.device, dtype=dtype)
     y = flag_train.megatron.bias_gelu_impl(x, b).cpu()
     z = (x.cpu() + b.cpu()).to(dtype).float()
-    ref = (.5 * z * (1 + torch.tanh(.79788456 * z * (1 + .044715 * z * z)))).to(dtype)
+    ref = (0.5 * z * (1 + torch.tanh(0.79788456 * z * (1 + 0.044715 * z * z)))).to(
+        dtype
+    )
     torch.testing.assert_close(y, ref, rtol=0, atol=0)
 
 
@@ -169,6 +183,7 @@ def test_ascend_public_nondefault_stream(dtype):
 @pytest.mark.skipif(device.vendor_name != "ascend", reason="Ascend stream/device guard")
 def test_ascend_guard_fallback(monkeypatch):
     import importlib
+
     module = importlib.import_module("flag_train.megatron.bias_gelu_impl")
     current = module.torch_device_fn.current_device
     guard = module.torch_device_fn.device
@@ -185,7 +200,9 @@ def test_ascend_guard_fallback(monkeypatch):
             super().__init__(device)
 
     x = torch.randn(2, 129, device=flag_train.device)
-    monkeypatch.setattr(module.torch_device_fn, "current_device", different_on_first_query)
+    monkeypatch.setattr(
+        module.torch_device_fn, "current_device", different_on_first_query
+    )
     monkeypatch.setattr(module.torch_device_fn, "device", RecordGuard)
     _check(x, torch.zeros(129, device=x.device))
     assert guarded == [x.device]
@@ -195,7 +212,9 @@ def test_ascend_guard_fallback(monkeypatch):
 @pytest.mark.skipif(device.vendor_name != "ascend", reason="Ascend activation epilogue")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_ascend_activation_dense_curve(dtype):
-    x = torch.linspace(-20, 20, 4097, dtype=dtype, device=flag_train.device).repeat(2, 1)
+    x = torch.linspace(-20, 20, 4097, dtype=dtype, device=flag_train.device).repeat(
+        2, 1
+    )
     for shape in [(), (4097,), x.shape]:
         _check(x, torch.zeros(shape, device=x.device, dtype=dtype))
 
@@ -204,14 +223,29 @@ def test_ascend_activation_dense_curve(dtype):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_ascend_activation_special_values(dtype):
     limit, tiny = torch.finfo(dtype).max, torch.finfo(dtype).tiny
-    values = [float("inf"), -float("inf"), float("nan"), limit, -limit,
-              0., -0., tiny / 128, -tiny / 128, tiny / 2, -tiny / 2, -3., 3.]
+    values = [
+        float("inf"),
+        -float("inf"),
+        float("nan"),
+        limit,
+        -limit,
+        0.0,
+        -0.0,
+        tiny / 128,
+        -tiny / 128,
+        tiny / 2,
+        -tiny / 2,
+        -3.0,
+        3.0,
+    ]
     x = torch.tensor(values, dtype=dtype, device=flag_train.device).repeat(2, 512)
     for shape in [(), (x.shape[-1],), x.shape]:
         b = torch.zeros(shape, device=x.device, dtype=dtype)
         y = flag_train.megatron.bias_gelu_impl(x, b).cpu()
         z = (x.cpu() + b.cpu()).to(dtype).double()
-        ref = (.5 * z * (1 + torch.tanh(.79788456 * z * (1 + .044715 * z * z)))).to(dtype)
+        ref = (0.5 * z * (1 + torch.tanh(0.79788456 * z * (1 + 0.044715 * z * z)))).to(
+            dtype
+        )
         assert torch.equal(torch.isnan(y), torch.isnan(ref))
         tol = {torch.float16: 3e-3, torch.bfloat16: 2e-2, torch.float32: 2e-5}[dtype]
         torch.testing.assert_close(y, ref, rtol=tol, atol=tol, equal_nan=True)
