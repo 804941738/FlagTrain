@@ -4,6 +4,7 @@ from .blocked_flash import blocked_flash
 from .cuda_wf6af16_linear import cuda_wf6af16_linear
 from .evoformer_attn import evoformer_attn
 from .lamb import lamb
+from .loco_quantized_reduction import loco_quantized_reduction
 from .mixed_gemm import mixed_gemm
 from .mixed_moe_gemm import mixed_moe_gemm
 from .multi_tensor_adam import multi_tensor_adam
@@ -16,6 +17,7 @@ __all__ = [
     "cuda_wf6af16_linear",
     "evoformer_attn",
     "lamb",
+    "loco_quantized_reduction",
     "mixed_gemm",
     "mixed_moe_gemm",
     "multi_tensor_adam",
