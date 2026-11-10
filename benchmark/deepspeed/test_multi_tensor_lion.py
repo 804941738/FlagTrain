@@ -16,10 +16,11 @@
 The baseline follows ``_DEEPSPEED_BASELINE_VENDORS`` below:
 
 * on a listed backend, DeepSpeed's ``multi_tensor_lion`` **is** the baseline.
-  If it cannot be built there the module raises rather than falling back --
-  measuring the torch reference and reporting it under the same name would
+  If it cannot be built there the loader warns and the baseline falls back to
+  ``multi_tensor_lion_ref``, which ``_BASELINE`` reports by its own name --
+  timing the torch reference while calling it the DeepSpeed baseline would
   answer a different question;
-* on any other backend the baseline is ``lion_ref``, the plain-torch
+* on any other backend the baseline is ``multi_tensor_lion_ref``, the plain-torch
   composition of the same contract, whether or not ``deepspeed`` is installed
   there. It is not a competitor, and the speedup there says how far the kernel
   is from *a* correct implementation rather than from the best one.
@@ -32,6 +33,8 @@ pointer arrays on every call; that asymmetry is the optimization being
 measured, not a benchmark artifact.
 """
 
+import warnings
+
 import pytest
 import torch
 
@@ -41,7 +44,7 @@ from .. import base
 
 # (n_tensors, numel) cases: small tensor counts with tiny/large tensors up to
 # a realistic training scale (256 tensors x 1M elements).
-_LION_SHAPES = [
+_MULTI_TENSOR_LION_SHAPES = [
     (8, 1024),
     (64, 1024),
     (256, 1024),
@@ -70,7 +73,7 @@ _STEP = 1
 # ---------------------------------------------------------------------------
 
 
-def lion_ref(
+def multi_tensor_lion_ref(
     chunk_size,
     noop_flag,
     tensor_lists,
@@ -96,13 +99,13 @@ def lion_ref(
 
 # Backends whose baseline is DeepSpeed. multi_tensor_lion ships as a CUDA op
 # builder, so only a backend that can compile and execute one can host it. On
-# these the baseline is not optional -- if it will not load, timing the torch
-# reference and reporting it under the DeepSpeed baseline's name would answer
-# another question.
+# these the baseline is expected: if it will not load, the loader warns and the
+# baseline falls back to multi_tensor_lion_ref, which _BASELINE reports by its
+# own name rather than as the DeepSpeed op.
 _DEEPSPEED_BASELINE_VENDORS = {"nvidia", "hygon"}
 
 
-def _load_deepspeed_lion():
+def _load_deepspeed_multi_tensor_lion():
     """DeepSpeed's multi_tensor_lion, or ``None`` on other backends.
 
     ``FusedLionBuilder`` JIT-compiles the CUDA source shipped inside the
@@ -117,28 +120,33 @@ def _load_deepspeed_lion():
 
         return FusedLionBuilder().load().multi_tensor_lion
     except Exception as exc:
-        raise RuntimeError(
-            f"{flag_train.vendor_name!r} must use DeepSpeed's multi_tensor_lion "
-            f"as its baseline, but it could not be loaded: {exc!r}. Build "
-            f"deepspeed, or drop the backend from _DEEPSPEED_BASELINE_VENDORS."
-        ) from exc
+        warnings.warn(
+            f"{flag_train.vendor_name!r} is expected to use DeepSpeed's "
+            f"multi_tensor_lion as its baseline, but it could not be loaded: "
+            f"{exc!r}. Falling back to the torch reference; build deepspeed "
+            f"to enable the fused baseline.",
+            stacklevel=2,
+        )
+        return None
 
 
 # Resolved once, so the first-use JIT compile is not counted in the measurement.
-_deepspeed_lion = _load_deepspeed_lion()
+_deepspeed_multi_tensor_lion = _load_deepspeed_multi_tensor_lion()
 
 _BASELINE = (
-    "deepspeed multi_tensor_lion" if _deepspeed_lion is not None else "lion_ref (torch)"
+    "deepspeed multi_tensor_lion"
+    if _deepspeed_multi_tensor_lion is not None
+    else "multi_tensor_lion_ref (torch)"
 )
 
 
-class LionBenchmark(base.GenericBenchmark):
-    DEFAULT_SHAPES = _LION_SHAPES
+class MultiTensorLionBenchmark(base.GenericBenchmark):
+    DEFAULT_SHAPES = _MULTI_TENSOR_LION_SHAPES
 
     def set_shapes(self, shape_file=None):
-        # lion needs 3 lists of tensors per case (grads, params, exp_avgs);
+        # multi_tensor_lion needs 3 lists of tensors per case (grads, params, exp_avgs);
         # keep the (n_tensors, numel) cases explicit to avoid OOM on CI GPUs.
-        self.shapes = list(_LION_SHAPES)
+        self.shapes = list(_MULTI_TENSOR_LION_SHAPES)
 
     def set_more_shapes(self):
         return []
@@ -151,7 +159,7 @@ class LionBenchmark(base.GenericBenchmark):
         return f"{len(gs)} tensors x {list(gs[0].shape)}"
 
 
-def lion_input_fn(shape, dtype, device):
+def multi_tensor_lion_input_fn(shape, dtype, device):
     n_tensors, numel = shape
     gs = [torch.randn((numel,), dtype=dtype, device=device) for _ in range(n_tensors)]
     ps = [torch.randn((numel,), dtype=dtype, device=device) for _ in range(n_tensors)]
@@ -184,7 +192,11 @@ def _call(op, gs, ps, ms):
 
 def torch_op(gs, ps, ms):
     """Baseline, chosen by platform. See the module docstring."""
-    baseline = _deepspeed_lion if _deepspeed_lion is not None else lion_ref
+    baseline = (
+        _deepspeed_multi_tensor_lion
+        if _deepspeed_multi_tensor_lion is not None
+        else multi_tensor_lion_ref
+    )
     return _call(baseline, gs, ps, ms)
 
 
@@ -194,17 +206,17 @@ def train_op(gs, ps, ms):
 
 
 @pytest.mark.multi_tensor_lion
-def test_lion_perf():
+def test_multi_tensor_lion_perf():
     print(f"\nBaseline: {_BASELINE}")
 
-    bench = LionBenchmark(
-        input_fn=lion_input_fn,
+    bench = MultiTensorLionBenchmark(
+        input_fn=multi_tensor_lion_input_fn,
         op_name="multi_tensor_lion",
         torch_op=torch_op,
         dtypes=[torch.float32, torch.float16, torch.bfloat16],
         # The local ratio is a real comparison when the baseline is DeepSpeed's
         # kernel, so --base-data's cross-hardware figure does not apply.
-        native_baseline=_deepspeed_lion is not None,
+        native_baseline=_deepspeed_multi_tensor_lion is not None,
     )
     bench.set_train(train_op)
     bench.run()
