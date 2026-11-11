@@ -32,6 +32,8 @@ _DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _BLOCK_SIZE = 256
 _NUM_WARPS = 4
 _IS_ASCEND = runtime_device.vendor_name == "ascend"
+_IS_NVIDIA = runtime_device.vendor_name == "nvidia"
+_NVIDIA_TANH = tl.constexpr(_IS_NVIDIA)
 if _IS_ASCEND:
     from flag_train.runtime.backend._ascend.utils import CORE_NUM
 
@@ -93,7 +95,18 @@ def _bias_gelu_tile(
         # Multiply by the reciprocal to preserve the original tiny-value path.
         result = z * (1.0 / (1.0 + tl.exp(-2.0 * argument)))
     else:
-        t = tl_extra_shim.tanh(argument)
+        if _NVIDIA_TANH:
+            # Native approximate tanh avoids the libdevice polynomial/exp paths.
+            t = tl.inline_asm_elementwise(
+                "tanh.approx.f32 $0, $1;",
+                constraints="=f,f",
+                args=[argument],
+                dtype=tl.float32,
+                is_pure=True,
+                pack=1,
+            )
+        else:
+            t = tl_extra_shim.tanh(argument)
         result = 0.5 * z * (1.0 + t)
     tl.store(Y + offsets, result, mask)
 
@@ -199,6 +212,9 @@ def bias_gelu_impl(input, bias):
         grid = (min(tiles, CORE_NUM),)
     else:
         block = _BLOCK_SIZE
+        if _IS_NVIDIA and n >= 65536:
+            # Wider tiles amortize CTA scheduling; FP32 favors a smaller tile.
+            block = 1024 if input_dtype == torch.float32 else 2048
         grid = (triton.cdiv(n, block),)
     # A tensor on the current NPU needs no device exchange. Keep the guard for
     # cross-device calls and leave every non-Ascend launch on its original path.
@@ -237,7 +253,8 @@ def bias_gelu_impl(input, bias):
                 BLOCK=block,
                 PERSISTENT=_IS_ASCEND,
                 num_warps=_NUM_WARPS,
-                EVEN=_IS_ASCEND and n % block == 0 and (mode != 1 or h % block == 0),
+                EVEN=n % block == 0
+                and (_IS_NVIDIA or (_IS_ASCEND and (mode != 1 or h % block == 0))),
                 **({"num_stages": 1} if _IS_ASCEND else {}),
             )
     return out
