@@ -68,7 +68,7 @@ def _bias_gelu_tile(
     ROWWISE: tl.constexpr,
     EVEN: tl.constexpr,
 ):
-    if ROWWISE and BIAS_MODE == 1 and not (H <= BLOCK and H & (H - 1) == 0):
+    if (ROWWISE and BIAS_MODE == 1) and not (H <= BLOCK and H & (H - 1) == 0):
         # Explicitly contiguous bias columns avoid Ascend's scalar gather
         # lowering of a vector remainder. Row tails have their own mask.
         columns = tile % tl.cdiv(H, BLOCK) * BLOCK + tl.arange(0, BLOCK)
@@ -83,7 +83,7 @@ def _bias_gelu_tile(
     if BIAS_MODE == 0:
         b = tl.load(B)
     elif BIAS_MODE == 1:
-        if ROWWISE and H <= BLOCK and H & (H - 1) == 0:
+        if (ROWWISE and H <= BLOCK) and H & (H - 1) == 0:
             row = tl.load(B + tl.arange(0, H))
             b = tl.broadcast_to(row[None, :], (BLOCK // H, H)).reshape((BLOCK,))
         elif ROWWISE:
@@ -136,7 +136,7 @@ def _bias_gelu_forward_kernel(
     if PERSISTENT:
         # Bound physical programs to vector cores; stride over arbitrarily many
         # logical tiles. The runtime trip count avoids compile-time unrolling.
-        if BIAS_MODE == 1 and H >= 128 and not (H <= BLOCK and H & (H - 1) == 0):
+        if (BIAS_MODE == 1 and H >= 128) and not (H <= BLOCK and H & (H - 1) == 0):
             tiles = (N // H) * tl.cdiv(H, BLOCK)
         else:
             tiles = tl.cdiv(N, BLOCK)
