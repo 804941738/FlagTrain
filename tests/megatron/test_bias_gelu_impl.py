@@ -13,9 +13,11 @@
 # limitations under the License.
 """Forward contract: dtype-rounded bias addition, layouts and special values.
 
-The formula reference preserves the existing precision tolerances; a separate
-case checks the installed Megatron forward. --ref cpu remains supported.
+Check the installed Megatron forward on the original inputs when available.
+The independent formula reference also supports --ref cpu.
 """
+
+from functools import cache
 
 import pytest
 import torch
@@ -39,11 +41,39 @@ if not utils.QUICK_MODE:
     ]
 
 
+@cache
+def _load_megatron():
+    try:
+        from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
+    except ModuleNotFoundError as exc:
+        if exc.name not in {
+            "megatron",
+            "megatron.core",
+            "megatron.core.fusions",
+            "megatron.core.fusions.fused_bias_gelu",
+        }:
+            raise
+        return None
+    return bias_gelu_impl
+
+
 def _check(x, b):
     y = flag_train.megatron.bias_gelu_impl(x, b)
     assert y.shape == torch.broadcast_shapes(x.shape, b.shape)
     assert y.dtype == x.dtype and y.device == x.device
     assert y.is_contiguous()
+
+    megatron_impl = _load_megatron()
+    if megatron_impl is not None:
+        # Eager Megatron rounds intermediate low-precision arithmetic; the
+        # FlagTrain kernel computes the activation in FP32.
+        rtol, atol = {
+            torch.float16: (5e-3, 1e-2),
+            torch.bfloat16: (4e-2, 8e-2),
+            torch.float32: (2e-5, 2e-5),
+        }[x.dtype]
+        torch.testing.assert_close(y, megatron_impl(x, b), rtol=rtol, atol=atol)
+
     # Round the add before upcasting, even for the CPU reference.
     z = (utils.to_reference(x.detach()) + utils.to_reference(b.detach())).to(x.dtype)
     z = utils.to_reference(z, upcast=True)
@@ -144,17 +174,9 @@ def test_bias_gelu_nonfinite(dtype):
 
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 def test_bias_gelu_installed_megatron(dtype):
-    module = pytest.importorskip("megatron.core.fusions.fused_bias_gelu")
+    if _load_megatron() is None:
+        pytest.skip("Megatron bias_gelu_impl is unavailable")
     utils.init_seed(3)
     x = torch.randn((16, 127), device=flag_train.device, dtype=dtype)
     b = torch.randn((127,), device=x.device, dtype=dtype)
-    y = flag_train.megatron.bias_gelu_impl(x, b)
-    ref = module.bias_gelu_impl(x, b)
-    # Eager Megatron rounds intermediate low-precision arithmetic; the kernel
-    # computes activation in fp32, so equality is tolerance based.
-    rtol, atol = {
-        torch.float16: (5e-3, 1e-2),
-        torch.bfloat16: (4e-2, 8e-2),
-        torch.float32: (2e-5, 2e-5),
-    }[dtype]
-    torch.testing.assert_close(y, ref, rtol=rtol, atol=atol)
+    _check(x, b)
