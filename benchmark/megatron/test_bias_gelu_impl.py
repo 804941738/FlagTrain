@@ -102,7 +102,11 @@ def _run():
     config = torch._dynamo.config
     limits = {
         name: max(getattr(config, name), 128)
-        for name in ("recompile_limit", "cache_size_limit", "accumulated_recompile_limit")
+        for name in (
+            "recompile_limit",
+            "cache_size_limit",
+            "accumulated_recompile_limit",
+        )
         if hasattr(config, name)
     }
     limits["suppress_errors"] = False
@@ -139,10 +143,13 @@ def _run():
         else:
             execution = nullcontext()
 
-        print(f"\nBaseline: megatron-core {importlib.metadata.version('megatron-core')}")
-        print(f"Baseline Mode: {mode}" + (
-            " (Megatron default torch.compile)" if mode == "compiled" else ""
-        ))
+        print(
+            f"\nBaseline: megatron-core {importlib.metadata.version('megatron-core')}"
+        )
+        print(
+            f"Baseline Mode: {mode}"
+            + (" (Megatron default torch.compile)" if mode == "compiled" else "")
+        )
         print("Operator: bias_gelu_impl (native GeLUFunction.apply)")
         if fallback_reason:
             print(f"Fallback Reason: {fallback_reason}")
