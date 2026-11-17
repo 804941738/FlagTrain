@@ -13,8 +13,8 @@
 # limitations under the License.
 """Forward contract: dtype-rounded bias addition, layouts and special values.
 
-Check the installed Megatron forward on the original inputs when available.
-The independent formula reference also supports --ref cpu.
+Compare the installed Megatron forward and an independent formula at
+reference precision after the bias sum is rounded to the input dtype.
 """
 
 from functools import cache
@@ -63,29 +63,20 @@ def _check(x, b):
     assert y.dtype == x.dtype and y.device == x.device
     assert y.is_contiguous()
 
-    megatron_impl = _load_megatron()
-    if megatron_impl is not None:
-        # Eager Megatron rounds intermediate low-precision arithmetic; the
-        # FlagTrain kernel computes the activation in FP32.
-        rtol, atol = {
-            torch.float16: (5e-3, 1e-2),
-            torch.bfloat16: (4e-2, 8e-2),
-            torch.float32: (2e-5, 2e-5),
-        }[x.dtype]
-        torch.testing.assert_close(y, megatron_impl(x, b), rtol=rtol, atol=atol)
-
-    # Round the add before upcasting, even for the CPU reference.
+    # Preserve the input-dtype rounding of the bias add, then evaluate GELU
+    # in reference precision on the device selected by --ref.
     z = (utils.to_reference(x.detach()) + utils.to_reference(b.detach())).to(x.dtype)
     z = utils.to_reference(z, upcast=True)
+    result = utils.to_reference(y)
+
+    megatron_impl = _load_megatron()
+    if megatron_impl is not None:
+        # Bias is already included in z, so use a scalar zero.
+        utils.train_assert_close(result, megatron_impl(z, z.new_zeros(())), x.dtype)
+
     t = torch.tanh(0.79788456 * z * (1 + 0.044715 * z * z))
-    ref = (0.5 * z * (1 + t)).to(x.dtype)
-    tolerances = {
-        torch.float16: (3e-3, 3e-3),
-        torch.bfloat16: (2e-2, 2e-2),
-        torch.float32: (2e-5, 2e-5),
-    }
-    rtol, atol = tolerances[x.dtype]
-    torch.testing.assert_close(utils.to_reference(y), ref, rtol=rtol, atol=atol)
+    ref = 0.5 * z * (1 + t)
+    utils.train_assert_close(result, ref, x.dtype)
 
 
 @pytest.mark.parametrize("shape", _SHAPES)
