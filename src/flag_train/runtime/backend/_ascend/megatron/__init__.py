@@ -25,6 +25,7 @@ from .fused_indices_to_multihot import fused_indices_to_multihot
 from .fused_pad_routing_map import fused_pad_routing_map
 from .fused_proj_rms_compute_h_backward import fused_proj_rms_compute_h_backward
 from .fused_proj_rms_compute_h_forward import fused_proj_rms_compute_h_forward
+from .fused_sinkhorn import fused_sinkhorn
 from .quick_geglu import quick_geglu
 from .quick_gelu import quick_gelu
 from .scaled_masked_softmax_cuda_backward import scaled_masked_softmax_cuda_backward
@@ -44,6 +45,7 @@ __all__ = [
     "fused_pad_routing_map",
     "fused_proj_rms_compute_h_backward",
     "fused_proj_rms_compute_h_forward",
+    "fused_sinkhorn",
     "quick_geglu",
     "quick_gelu",
     "scaled_masked_softmax_cuda_backward",

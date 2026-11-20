@@ -297,6 +297,20 @@ ops:
   source: megatron.core.transformer.hyper_connection
   stages:
   - beta: '0.0.0'
+- id: fused_sinkhorn
+  description: Sinkhorn projection and its first-order input gradient.
+  for:
+  - fused_sinkhorn
+  labels:
+  - megatron
+  - normalization
+  from:
+  - megatron
+  kind:
+  - Normalization
+  source: megatron.core.transformer.hyper_connection
+  stages:
+  - beta: '0.0.0'
 - id: lamb
   description: 'Fused LAMB optimizer update. Supports fp32 or fp64 master weights
     and moments; fp16 gradients against fp32 master weights are also supported.'
