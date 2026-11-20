@@ -20,6 +20,7 @@ from .mtp_loss_auto_scaler import mtp_loss_auto_scaler
 from .multi_modal_rotary_embedding import multi_modal_rotary_embedding
 from .quick_geglu import quick_geglu
 from .quick_gelu import quick_gelu
+from .router_gating_linear_function import router_gating_linear_function
 from .scaled_masked_softmax_cuda_backward import scaled_masked_softmax_cuda_backward
 from .scaled_masked_softmax_cuda_forward import scaled_masked_softmax_cuda_forward
 from .scaled_upper_triang_masked_softmax_backward import (
@@ -53,6 +54,7 @@ __all__ = [
     "multi_modal_rotary_embedding",
     "quick_geglu",
     "quick_gelu",
+    "router_gating_linear_function",
     "scaled_masked_softmax_cuda_backward",
     "scaled_masked_softmax_cuda_forward",
     "scaled_upper_triang_masked_softmax_backward",
