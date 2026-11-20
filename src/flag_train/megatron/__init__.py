@@ -17,6 +17,7 @@ from .fused_proj_rms_compute_h_forward import fused_proj_rms_compute_h_forward
 from .fused_proj_rms_forward import fused_proj_rms_forward
 from .fused_sinkhorn import fused_sinkhorn
 from .mtp_loss_auto_scaler import mtp_loss_auto_scaler
+from .multi_modal_rotary_embedding import multi_modal_rotary_embedding
 from .quick_geglu import quick_geglu
 from .quick_gelu import quick_gelu
 from .scaled_masked_softmax_cuda_backward import scaled_masked_softmax_cuda_backward
@@ -49,6 +50,7 @@ __all__ = [
     "fused_proj_rms_forward",
     "fused_sinkhorn",
     "mtp_loss_auto_scaler",
+    "multi_modal_rotary_embedding",
     "quick_geglu",
     "quick_gelu",
     "scaled_masked_softmax_cuda_backward",
