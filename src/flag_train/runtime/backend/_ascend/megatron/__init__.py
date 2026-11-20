@@ -37,6 +37,7 @@ from .scaled_upper_triang_masked_softmax_forward import (
     scaled_upper_triang_masked_softmax_forward,
 )
 from .weighted_squared_relu_impl import weighted_squared_relu_impl
+from .weighted_swiglu_funciton import weighted_swiglu_funciton
 
 __all__ = [
     "fast_gelu",
@@ -53,4 +54,5 @@ __all__ = [
     "scaled_upper_triang_masked_softmax_backward",
     "scaled_upper_triang_masked_softmax_forward",
     "weighted_squared_relu_impl",
+    "weighted_swiglu_funciton",
 ]
