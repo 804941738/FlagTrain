@@ -142,7 +142,9 @@ def _check_native_forward(native, x, scale):
 @pytest.mark.tanh_soft_clamp
 @pytest.mark.parametrize("scale, transpose", [(2.0, False), (2.5, True), (-2.5, False)])
 def test_tanh_soft_clamp_int32_native(megatron_tanh_soft_clamp, scale, transpose):
-    x = torch.tensor([[-3, -1, 0], [1, 2, 3]], dtype=torch.int32, device=flag_train.device)
+    x = torch.tensor(
+        [[-3, -1, 0], [1, 2, 3]], dtype=torch.int32, device=flag_train.device
+    )
     if transpose:
         x = x.t()
         assert not x.is_contiguous()
