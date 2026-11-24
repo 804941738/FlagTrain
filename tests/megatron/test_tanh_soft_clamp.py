@@ -133,10 +133,11 @@ def _check_native_forward(native, x, scale):
     assert actual.shape == expected.shape
     assert actual.dtype == expected.dtype == x.dtype
     assert actual.device == expected.device == x.device
+    expected = utils.to_reference(expected)
     if x.dtype == torch.int32:
-        assert torch.equal(actual, expected)
+        utils.train_assert_equal(actual, expected)
     else:
-        flag_train.testing.assert_close(actual, expected, x.dtype)
+        utils.train_assert_close(actual, expected, x.dtype)
 
 
 @pytest.mark.tanh_soft_clamp
